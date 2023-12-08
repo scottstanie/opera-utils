@@ -5,8 +5,13 @@ from pathlib import Path
 
 import pytest
 
-from opera_utils import filter_by_burst_id, get_burst_id, group_by_burst
 from opera_utils._helpers import flatten
+from opera_utils.bursts import (
+    S1BurstId,
+    filter_by_burst_id,
+    get_burst_id,
+    group_by_burst,
+)
 
 
 def test_get_burst_id():
@@ -104,3 +109,49 @@ def test_filter_by_burst_id():
     expected = [in_files[1]]
     random.shuffle(in_files)
     assert filter_by_burst_id(in_files, burst_id) == expected
+
+
+class TestS1BurstId:
+    @pytest.mark.parametrize(
+        "input_str,expected",
+        [
+            ("t123_000456_iw1", S1BurstId(123, 456, 1)),
+            ("T123-000456-IW2", S1BurstId(123, 456, 2)),
+            ("t456_123456_iw3", S1BurstId(456, 123456, 3)),
+        ],
+    )
+    def test_from_str(self, input_str, expected):
+        """Test the from_str class method."""
+        assert S1BurstId.from_str(input_str) == expected
+
+    @pytest.mark.parametrize(
+        "input_str,expected",
+        [
+            ("T123-000456-IW1", "t123_000456_iw1"),
+            ("T123_000456_IW2", "t123_000456_iw2"),
+            ("t123_000456_iw3", "t123_000456_iw3"),
+        ],
+    )
+    def test_normalize_burst_id_str(self, input_str, expected):
+        """Test the normalize_burst_id_str static method."""
+        assert S1BurstId.normalize_burst_id_str(input_str) == expected
+
+    def test_str_method(self):
+        """Test the __str__ method."""
+        burst_id = S1BurstId(123, 456, 1)
+        assert str(burst_id) == "t123_000456_iw1"
+
+    @pytest.mark.parametrize(
+        "input_obj,other,expected",
+        [
+            (S1BurstId(123, 456, 1), "t123_000456_iw1", True),
+            (S1BurstId(123, 456, 1), S1BurstId(123, 456, 1), True),
+            (S1BurstId(123, 456, 1), "t123_000457_iw1", False),
+            (S1BurstId(123, 456, 1), S1BurstId(123, 457, 1), False),
+            (S1BurstId(123, 456, 1), S1BurstId(124, 456, 1), False),
+            (S1BurstId(123, 456, 1), S1BurstId(123, 456, 2), False),
+        ],
+    )
+    def test_eq_method(self, input_obj, other, expected):
+        """Test the __eq__ method."""
+        assert (input_obj == other) is expected

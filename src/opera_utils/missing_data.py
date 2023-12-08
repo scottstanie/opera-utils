@@ -11,7 +11,7 @@ import numpy as np
 from ._dates import get_dates
 from ._helpers import flatten, powerset, sorted_deduped_values
 from ._types import Filename
-from .bursts import group_by_burst
+from .bursts import S1BurstId, group_by_burst
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +29,7 @@ class BurstSubsetOption:
 
     total_num_bursts: int
     """Total number of bursts used in this subset."""
-    burst_ids: tuple[str, ...]
+    burst_ids: tuple[S1BurstId, ...]
     """Burst IDs used in this subset."""
     dates: tuple[date, ...]
     """Dates used in this subset."""
@@ -47,8 +47,8 @@ class BurstSubsetOption:
 
 def get_burst_id_to_dates(
     slc_files: Optional[Iterable[Filename]] = None,
-    burst_id_date_tuples: Optional[Iterable[tuple[str, date]]] = None,
-) -> dict[str, list[date]]:
+    burst_id_date_tuples: Optional[Iterable[tuple[str | S1BurstId, date]]] = None,
+) -> dict[S1BurstId, list[date]]:
     """Get a mapping of burst ID to list of dates.
 
     Assumes that the `slc_files` have only one date in the name, or
@@ -60,12 +60,12 @@ def get_burst_id_to_dates(
     ----------
     slc_files : Optional[Iterable[Filename]]
         List of OPERA CSLC filenames.
-    burst_id_date_tuples : Optional[Iterable[tuple[str, date]]]
+    burst_id_date_tuples : Optional[Iterable[tuple[str | S1BurstId, date]]]
         Alternative input: list of all existing (burst_id, date) tuples.
 
     Returns
     -------
-    dict[str, list[date]]
+    dict[S1BurstId, list[date]]
         Mapping of burst ID to list of dates.
     """
     if slc_files is not None:
@@ -78,7 +78,7 @@ def get_burst_id_to_dates(
 
 def get_missing_data_options(
     slc_files: Optional[Iterable[Filename]] = None,
-    burst_id_date_tuples: Optional[Iterable[tuple[str, date]]] = None,
+    burst_id_date_tuples: Optional[Iterable[tuple[S1BurstId | str, date]]] = None,
 ) -> list[BurstSubsetOption]:
     """Get a list of possible data subsets for a set of burst SLCs.
 
@@ -120,13 +120,13 @@ def get_missing_data_options(
 
 
 def get_burst_id_date_incidence(
-    burst_id_to_dates: Mapping[str, list[date]]
+    burst_id_to_dates: Mapping[S1BurstId, list[date]]
 ) -> np.ndarray:
     """Create a matrix of burst ID vs. date incidence.
 
     Parameters
     ----------
-    burst_id_to_dates : Mapping[str, list[date]]
+    burst_id_to_dates : Mapping[S1BurstId, list[date]]
         Mapping of burst ID to list of dates.
 
     Returns
@@ -150,23 +150,23 @@ def get_burst_id_date_incidence(
 
 
 def _burst_id_mapping_from_tuples(
-    burst_id_date_tuples: Iterable[tuple[str, date]]
-) -> dict[str, list[date]]:
+    burst_id_date_tuples: Iterable[tuple[str | S1BurstId, date]]
+) -> dict[S1BurstId, list[date]]:
     """Create a {burst_id -> [date,...]} (burst_id, date) tuples."""
     # Don't exhaust the iterator for multiple groupings
     burst_id_date_tuples = list(burst_id_date_tuples)
 
     # Group the possible SLC files by their date and by their Burst ID
     return {
-        burst_id: [date for burst_id, date in g]
+        burst_id: [date for _, date in g]
         for burst_id, g in groupby(burst_id_date_tuples, key=lambda x: x[0])
     }
 
 
 def _burst_id_mapping_from_files(
     slc_files: Iterable[Filename],
-) -> dict[str, list[date]]:
-    """Create a {burst_id -> [date,...]} mapping from filenames."""
+) -> dict[S1BurstId, list[date]]:
+    """Create a {S1BurstId -> [date,...]} mapping from filenames."""
     # Don't exhaust the iterator for multiple groupings
     slc_file_list = list(map(str, slc_files))
 
@@ -183,7 +183,7 @@ def _burst_id_mapping_from_files(
 
 
 def generate_burst_subset_options(
-    B: np.ndarray, burst_ids: Sequence[str], dates: Sequence[date]
+    B: np.ndarray, burst_ids: Sequence[S1BurstId], dates: Sequence[date]
 ) -> list[BurstSubsetOption]:
     """Generate possible valid subsets of the given SLC data.
 
@@ -193,7 +193,7 @@ def generate_burst_subset_options(
         Matrix of burst ID vs. date incidence.
         Rows correspond to burst IDs, columns correspond to dates.
         A value of True indicates that the burst ID was acquired on that date.
-    burst_ids : Sequence[str]
+    burst_ids : Sequence[S1BurstId]
         List of all burst IDs.
     dates : Sequence[date]
         List of all dates.

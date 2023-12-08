@@ -6,9 +6,10 @@ import logging
 import re
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from os import fspath
 from pathlib import Path
-from typing import Iterable, Pattern, Sequence, Union, overload
+from typing import Any, Iterable, Pattern, Sequence, Union, overload
 
 import h5py
 from shapely import geometry, ops, wkt
@@ -19,6 +20,7 @@ from .constants import OPERA_BURST_RE, OPERA_DATASET_NAME, OPERA_IDENTIFICATION
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "S1BurstId",
     "get_burst_id",
     "group_by_burst",
     "sort_by_burst_id",
@@ -29,9 +31,76 @@ __all__ = [
 ]
 
 
+@dataclass(frozen=True, order=True)
+class S1BurstId:
+    """Class representing a Sentinel-1 Burst ID."""
+
+    track_number: int
+    esa_burst_id: int
+    subswath: int
+
+    def __post_init__(self):
+        if not (1 <= self.track_number <= 175):
+            raise ValueError("track_number must be an integer from 1 to 175")
+        if not (1 <= self.subswath <= 3):
+            raise ValueError(f"subswath={self.subswath}, must be 1, 2 or 3")
+        if self.esa_burst_id < 1:
+            raise ValueError("esa_burst_id must be a positive integer")
+
+    @classmethod
+    def from_str(cls, burst_id_str: str) -> "S1BurstId":
+        """Parse a S1BurstId object from a string.
+
+        Parameters
+        ----------
+        burst_id_str : str
+            The burst ID string, e.g. "t123_000456_iw1"
+
+        Returns
+        -------
+        S1BurstId
+            The burst ID object containing track number + ESA's burstId number + swath ID.
+        """
+        if isinstance(burst_id_str, cls):
+            return burst_id_str
+
+        track_number, esa_burst_id, subswath = cls.normalize_burst_id_str(
+            burst_id_str
+        ).split("_")
+
+        return cls(int(track_number[1:]), int(esa_burst_id), int(subswath))
+
+    @staticmethod
+    def normalize_burst_id_str(burst_id_str: str) -> str:
+        """Convert a burst ID string to be lowercase and underscores.
+
+        Desired output format:
+            t123_012345_iw1
+
+        Different locations use things like
+            "T123-012345-IW3"
+            "T123_012345_IW3"
+        """
+        return burst_id_str.lower().replace("-", "_")
+
+    def __str__(self) -> str:
+        # Form the unique JPL ID by combining track/burst/swath
+        return f"t{self.track_number:03d}_{self.esa_burst_id:06d}_iw{self.subswath}"
+
+    def __eq__(self, other: Any) -> bool:
+        # Allows for comparison with strings, as well as S1BurstId objects
+        # e.g., you can filter down burst IDs with:
+        # burst_ids = ["t012_024518_iw3", "t012_024519_iw3"]
+        # bursts = [b for b in bursts if b.burst_id in burst_ids]
+        if isinstance(other, str):
+            return str(self) == other
+        else:
+            return super().__eq__(other)
+
+
 def get_burst_id(
     filename: Filename, burst_id_fmt: Union[str, Pattern[str]] = OPERA_BURST_RE
-) -> str:
+) -> S1BurstId:
     """Extract the burst id from a filename.
 
     Matches either format of
@@ -55,15 +124,14 @@ def get_burst_id(
     if not (m := re.search(burst_id_fmt, str(filename))):
         raise ValueError(f"Could not parse burst id from {filename}")
     burst_str = m.group()
-    # Normalize
-    return burst_str.lower().replace("-", "_")
+    return S1BurstId.from_str(burst_str)
 
 
 @overload
 def group_by_burst(
     file_list: Iterable[str],
     burst_id_fmt: Union[str, Pattern[str]] = OPERA_BURST_RE,
-) -> dict[str, list[str]]:
+) -> dict[S1BurstId, list[str]]:
     ...
 
 
@@ -71,7 +139,7 @@ def group_by_burst(
 def group_by_burst(
     file_list: Iterable[PathLikeT],
     burst_id_fmt: Union[str, Pattern[str]] = OPERA_BURST_RE,
-) -> dict[str, list[PathLikeT]]:
+) -> dict[S1BurstId, list[PathLikeT]]:
     ...
 
 
@@ -149,7 +217,7 @@ def sort_by_burst_id(file_list, burst_id_fmt):
 @overload
 def filter_by_burst_id(
     files: Iterable[PathLikeT],
-    burst_ids: str | Iterable[str],
+    burst_ids: Iterable[S1BurstId] | Iterable[str],
 ) -> list[PathLikeT]:
     ...
 
@@ -157,7 +225,7 @@ def filter_by_burst_id(
 @overload
 def filter_by_burst_id(
     files: Iterable[str],
-    burst_ids: str | Iterable[str],
+    burst_ids: Iterable[S1BurstId] | Iterable[str],
 ) -> list[str]:
     ...
 
@@ -171,7 +239,7 @@ def filter_by_burst_id(files, burst_ids):
     ----------
     files : Iterable[PathLikeT] or Iterable[str]
         Iterable of files to filter
-    burst_ids : str | Iterable[str]
+    burst_ids : Iterable[S1BurstId] | Iterable[str]
         Burst ID/Iterable containing the of burst IDs to keep
 
     Returns
@@ -179,10 +247,8 @@ def filter_by_burst_id(files, burst_ids):
     list[PathLikeT] or list[str]
         filtered list of files
     """
-    if isinstance(burst_ids, str):
-        burst_ids = [burst_ids]
+    burst_id_set = set([S1BurstId(b) for b in burst_ids])
 
-    burst_id_set = set(burst_ids)
     parsed_burst_ids = [get_burst_id(Path(f).name) for f in files]
     # Only search the burst ID in the name, not the full path
     return [f for (f, b) in zip(files, parsed_burst_ids) if b in burst_id_set]
