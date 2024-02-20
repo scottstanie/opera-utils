@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import zipfile
+from functools import cache
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -9,6 +10,7 @@ from . import datasets
 from ._types import Bbox, PathOrStr
 
 
+@cache
 def read_zipped_json(filename: PathOrStr):
     """Read a zipped JSON file and returns its contents as a dictionary.
 
@@ -50,7 +52,7 @@ def get_frame_to_burst_mapping(
     """
     if json_file is None:
         json_file = datasets.fetch_frame_to_burst_mapping_file()
-    js = read_zipped_json(json_file)
+    js = read_zipped_json(Path(json_file))
     return js["data"][str(frame_id)]
 
 
@@ -166,3 +168,26 @@ def get_burst_ids_for_frame(
     """
     frame_data = get_frame_to_burst_mapping(frame_id, json_file)
     return frame_data["burst_ids"]
+
+
+def get_burst_to_frame_mapping(
+    burst_id: str, json_file: Optional[PathOrStr] = None
+) -> dict:
+    """Get the list of Frame IDs for one Burst ID.
+
+    Parameters
+    ----------
+    burst_id : int
+        The Burst ID to look up.
+    json_file : PathOrStr, optional
+        The path to the JSON file containing the burst-to-frame mapping.
+        If `None`, uses the zip file contained in `data/`
+    Returns
+    -------
+    dict
+        The frame data for the given Burst ID.
+    """
+    if json_file is None:
+        json_file = datasets.fetch_burst_to_frame_mapping_file()
+    js = read_zipped_json(Path(json_file))
+    return js["data"][burst_id]
