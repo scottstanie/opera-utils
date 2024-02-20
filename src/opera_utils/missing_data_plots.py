@@ -23,6 +23,7 @@ def plot_burst_id_date_incidence(
     burst_id_date_tuples: Optional[Iterable[tuple[str, date]]] = None,
     ax=None,
     output_file: Optional[PathOrStr] = None,
+    add_colorbar: bool = True,
 ) -> tuple[plt.figure, plt.Axes]:
     """Plot a matrix of burst ID vs. date incidence.
 
@@ -39,6 +40,8 @@ def plot_burst_id_date_incidence(
         Axes to plot on. If None, a new figure and axes will be created.
     output_file : Optional[PathOrStr]
         Name of file to save figure to.
+    add_colorbar : bool, default = True
+        If True, adds a colorbar to the figure.
 
     Returns
     -------
@@ -72,6 +75,7 @@ def plot_burst_id_date_incidence(
         ax=ax,
         fig=fig,
         cbar_labels=cbar_labels,
+        add_colorbar=add_colorbar,
     )
     fig.tight_layout()
     if output_file:
@@ -91,8 +95,9 @@ def _plot_incidence_per_date(
     dates: Sequence[date],
     fig,
     ax,
-    colors: Sequence[str] = ["#a2cffe", "#fdae61"],
+    colors: Sequence[str] = ["#0472e8", "#fdae61"],
     cbar_labels: Sequence[str] = ["False", "True"],
+    add_colorbar: bool = True,
 ):
     """Make a scatterplot with fixed datetime xaxis and variable spacing between items."""
     # Define a color map with two colors: one for True, one for False
@@ -108,18 +113,7 @@ def _plot_incidence_per_date(
 
     # Square marker
     marker = "s"
-    ax.scatter(xs, ys, c=cs, s=80, marker=marker, edgecolors="k")
-
-    # Define the colormap for the binary data and create a ScalarMappable object
-    cmap = ListedColormap(colors)  # Colorblind-friendly colors
-    norm = Normalize(vmin=0, vmax=1)  # Binary data, so only 0 and 1
-    mappable = ScalarMappable(norm=norm, cmap=cmap)
-
-    # Create the colorbar
-    cbar = plt.colorbar(mappable, ticks=[0, 1])
-    # Set the tick location to be in the middle of the color segment
-    cbar.set_ticks([0.25, 0.75])
-    cbar.ax.set_yticklabels(cbar_labels)  # Set the tick labels
+    ax.scatter(xs, ys, c=cs, s=80, marker=marker, edgecolors="none")
 
     # Format the x-axis to display dates
     ax.xaxis_date()
@@ -134,6 +128,18 @@ def _plot_incidence_per_date(
     # Draw gridlines for each fixed date
     ax.grid(True, which="both", linestyle="--", linewidth=0.5)
     ax.set_xticks(fixed_date_nums, minor=True)
+
+    if add_colorbar:
+        # Define the colormap for the binary data and create a ScalarMappable object
+        cmap = ListedColormap(colors)  # Colorblind-friendly colors
+        norm = Normalize(vmin=0, vmax=1)  # Binary data, so only 0 and 1
+        mappable = ScalarMappable(norm=norm, cmap=cmap)
+
+        # Create the colorbar
+        cbar = plt.colorbar(mappable, ticks=[0, 1])
+        # Set the tick location to be in the middle of the color segment
+        cbar.set_ticks([0.25, 0.75])
+        cbar.ax.set_yticklabels(cbar_labels)  # Set the tick labels
     return fig, ax
 
 
