@@ -131,14 +131,19 @@ def get_orbit_arrays(
         Reference epoch of orbit.
 
     """
-    with h5py.File(h5file) as hf:
-        orbit_group = hf["/metadata/orbit"]
-        times = orbit_group["time"][:]
-        positions = np.stack([orbit_group[f"position_{p}"] for p in ["x", "y", "z"]]).T
-        velocities = np.stack([orbit_group[f"velocity_{p}"] for p in ["x", "y", "z"]]).T
-        reference_epoch = datetime.datetime.fromisoformat(
-            orbit_group["reference_epoch"][()].decode()
-        )
+    input_is_file = isinstance(h5file, h5py.File)
+    hf = h5file if input_is_file else h5py.File(h5file)
+
+    orbit_group = hf["/metadata/orbit"]
+    times = orbit_group["time"][:]
+    positions = np.stack([orbit_group[f"position_{p}"] for p in ["x", "y", "z"]]).T
+    velocities = np.stack([orbit_group[f"velocity_{p}"] for p in ["x", "y", "z"]]).T
+    reference_epoch = datetime.datetime.fromisoformat(
+        orbit_group["reference_epoch"][()].decode()
+    )
+
+    if not input_is_file:
+        hf.close()
 
     return times, positions, velocities, reference_epoch
 
@@ -196,11 +201,15 @@ def get_xy_coords(h5file: FilenameOrHandle, subsample: int = 100) -> tuple:
         EPSG code of projection.
 
     """
-    with h5py.File(h5file) as hf:
-        x = hf["/data/x_coordinates"][:]
-        y = hf["/data/y_coordinates"][:]
-        projection = hf["/data/projection"][()]
+    input_is_file = isinstance(h5file, h5py.File)
+    hf = h5file if input_is_file else h5py.File(h5file)
 
+    x = hf["/data/x_coordinates"][:]
+    y = hf["/data/y_coordinates"][:]
+    projection = hf["/data/projection"][()]
+
+    if not input_is_file:
+        hf.close()
     return x[::subsample], y[::subsample], projection
 
 
