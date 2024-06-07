@@ -6,6 +6,7 @@ from typing import Any, Callable
 import h5py
 import numpy as np
 from pyproj import CRS, Transformer
+from typing_extensions import TypeAlias
 
 from ._types import Filename
 
@@ -18,9 +19,11 @@ __all__ = [
     "get_cslc_orbit",
 ]
 
+FilenameOrHandle: TypeAlias = Filename | h5py.File
+
 
 def get_zero_doppler_time(
-    filename: Filename, type_: str = "start"
+    filename: FilenameOrHandle, type_: str = "start"
 ) -> datetime.datetime:
     """Get the full acquisition time from the CSLC product.
 
@@ -28,7 +31,7 @@ def get_zero_doppler_time(
 
     Parameters
     ----------
-    filename : Filename
+    filename : FilenameOrHandle
         Path to the CSLC product.
     type_ : str, optional
         Either "start" or "stop", by default "start".
@@ -49,7 +52,7 @@ def get_zero_doppler_time(
 
 
 def _get_dset_and_attrs(
-    filename: Filename,
+    filename: FilenameOrHandle,
     dset_name: str,
     parse_func: Callable = lambda x: x,
 ) -> tuple[Any, dict[str, Any]]:
@@ -57,7 +60,7 @@ def _get_dset_and_attrs(
 
     Parameters
     ----------
-    filename : Filename
+    filename : FilenameOrHandle
         Path to the CSLC product.
     dset_name : str
         Name of the dataset.
@@ -73,19 +76,27 @@ def _get_dset_and_attrs(
     attrs : dict
         Attributes.
     """
-    with h5py.File(filename, "r") as hf:
+
+    def _process(hf):
         dset = hf[dset_name]
         attrs = dict(dset.attrs)
         value = parse_func(dset[()])
         return value, attrs
 
+    if isinstance(filename, h5py.File):
+        # Don't close it if they pass the opened `File`
+        return _process(filename)
+    else:
+        with h5py.File(filename, "r") as hf:
+            return _process(hf)
 
-def get_radar_wavelength(filename: Filename):
+
+def get_radar_wavelength(filename: FilenameOrHandle):
     """Get the radar wavelength from the CSLC product.
 
     Parameters
     ----------
-    filename : Filename
+    filename : FilenameOrHandle
         Path to the CSLC product.
 
     Returns
@@ -99,13 +110,13 @@ def get_radar_wavelength(filename: Filename):
 
 
 def get_orbit_arrays(
-    h5file: Filename,
+    h5file: FilenameOrHandle,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, datetime.datetime]:
     """Parse orbit info from OPERA S1 CSLC HDF5 file into python types.
 
     Parameters
     ----------
-    h5file : Filename
+    h5file : FilenameOrHandle
         Path to OPERA S1 CSLC HDF5 file.
 
     Returns
@@ -132,14 +143,14 @@ def get_orbit_arrays(
     return times, positions, velocities, reference_epoch
 
 
-def get_cslc_orbit(h5file: Filename):
+def get_cslc_orbit(h5file: FilenameOrHandle):
     """Parse orbit info from OPERA S1 CSLC HDF5 file into an isce3.core.Orbit.
 
     `isce3` must be installed to use this function.
 
     Parameters
     ----------
-    h5file : Filename
+    h5file : FilenameOrHandle
         Path to OPERA S1 CSLC HDF5 file.
 
     Returns
@@ -165,12 +176,12 @@ def get_cslc_orbit(h5file: Filename):
     return Orbit(orbit_svs)
 
 
-def get_xy_coords(h5file: Filename, subsample: int = 100) -> tuple:
+def get_xy_coords(h5file: FilenameOrHandle, subsample: int = 100) -> tuple:
     """Get x and y grid from OPERA S1 CSLC HDF5 file.
 
     Parameters
     ----------
-    h5file : Filename
+    h5file : FilenameOrHandle
         Path to OPERA S1 CSLC HDF5 file.
     subsample : int, optional
         Subsampling factor, by default 100
@@ -194,13 +205,13 @@ def get_xy_coords(h5file: Filename, subsample: int = 100) -> tuple:
 
 
 def get_lonlat_grid(
-    h5file: Filename, subsample: int = 100
+    h5file: FilenameOrHandle, subsample: int = 100
 ) -> tuple[np.ndarray, np.ndarray]:
     """Get 2D latitude and longitude grid from OPERA S1 CSLC HDF5 file.
 
     Parameters
     ----------
-    h5file : Filename
+    h5file : FilenameOrHandle
         Path to OPERA S1 CSLC HDF5 file.
     subsample : int, optional
         Subsampling factor, by default 100
