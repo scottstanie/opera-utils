@@ -145,6 +145,183 @@ def search_cslcs(
     return results, missing_data_options
 
 
+import asf_search as asf
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import pandas as pd
+
+
+def search_and_group(
+    start: str,
+    end: str,
+    bounds: tuple[float, float, float, float] | None = None,
+    aoi_polygon: str | None = None,
+    track: int | None = None,
+    burst_ids: list[str] | None = None,
+    max_results: int = 1000,
+) -> dict[int, tuple[ASFSearchResults, list[dict]]]:
+    if bounds is not None:
+        if aoi_polygon is not None:
+            raise ValueError("Can't pass both `bounds` and `aoi_polygon`")
+        aoi = box(*bounds).wkt
+    else:
+        aoi = aoi_polygon
+
+    results = asf.search(
+        start=start,
+        end=end,
+        intersectsWith=aoi,
+        relativeOrbit=track,
+        operaBurstID=list(burst_ids) if burst_ids is not None else None,
+        processingLevel=L2Product.CSLC.value,
+        maxResults=max_results,
+    )
+    logger.debug(f"Found {len(results)} total results before deduping pgeVersion")
+    results = filter_results_by_date_and_version(results)
+    logger.info(f"Found {len(results)} results")
+
+    # Group results by pathNumber
+    grouped_results = {}
+    for result in results:
+        path_number = result.properties["pathNumber"]
+        if path_number not in grouped_results:
+            grouped_results[path_number] = []
+        grouped_results[path_number].append(result)
+
+    # Process each group
+    final_results = {}
+    for path_number, group_results in grouped_results.items():
+        group_asf_results = ASFSearchResults(group_results)
+        slc_files = [r.properties["fileName"] for r in group_results]
+        missing_data_options = get_missing_data_options(slc_files=slc_files)
+        final_results[path_number] = (group_asf_results, missing_data_options)
+
+    return final_results
+
+
+def create_plot(grouped_results: dict[int, tuple[ASFSearchResults, list[dict]]]):
+    fig, ax = plt.subplots(figsize=(15, 10))
+
+    colors = plt.cm.get_cmap("tab10")
+    for idx, (path_number, (results, missing_data_options)) in enumerate(
+        grouped_results.items()
+    ):
+        color = colors(idx % 10)
+
+        gdf = gpd.GeoDataFrame.from_features(results.geojson()["features"])
+        gdf.set_crs(4326, inplace=True)
+        gdf = gdf[["geometry", "pathNumber", "polarization", "fileName", "stopTime"]]
+
+        gdf.plot(ax=ax, color=color, alpha=0.5, label=f"Path {path_number}")
+
+        # Add text for the first polygon in each path
+        first_poly = gdf.iloc[0]
+        centroid = first_poly.geometry.centroid
+        ax.text(
+            centroid.x,
+            centroid.y,
+            f"Path {path_number}",
+            fontsize=8,
+            ha="center",
+            va="center",
+        )
+
+    ax.legend(loc="center left", bbox_to_anchor=(1, 0.5))
+    ax.set_title("Sentinel-1 Frame Options")
+    plt.tight_layout()
+    plt.savefig("sentinel_frame_options.png", dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+import contextily as ctx
+from matplotlib.patches import Patch
+
+
+def create_plot2(
+    grouped_results: dict[int, tuple[ASFSearchResults, list[dict]]],
+    outfile: PathOrStr = Path("sentinel_frame_options.png"),
+):
+    fig, ax = plt.subplots(figsize=(15, 10))
+
+    colors = plt.cm.get_cmap("tab10")
+    legend_elements = []
+
+    for idx, (path_number, (results, missing_data_options)) in enumerate(
+        grouped_results.items()
+    ):
+        color = colors(idx % 10)
+
+        gdf = gpd.GeoDataFrame.from_features(results.geojson()["features"])
+        gdf.set_crs(4326, inplace=True)
+        gdf = gdf[["geometry", "pathNumber", "polarization", "fileName", "stopTime"]]
+
+        gdf.plot(ax=ax, color=color, alpha=0.3, edgecolor=color, linewidth=1)
+
+        # Add text for the first polygon in each path
+        first_poly = gdf.iloc[0]
+        centroid = first_poly.geometry.centroid
+        ax.text(
+            centroid.x,
+            centroid.y,
+            f"Path {path_number}",
+            fontsize=8,
+            ha="center",
+            va="center",
+            bbox=dict(facecolor="white", alpha=0.7, edgecolor="none"),
+        )
+
+        # Add to legend
+        legend_elements.append(
+            Patch(
+                facecolor=color,
+                edgecolor=color,
+                alpha=0.3,
+                label=f"Path {path_number} ({len(gdf)} frames)",
+            )
+        )
+
+    # Add basemap as background
+    ctx.add_basemap(ax, crs=gdf.crs.to_string(), source=ctx.providers.CartoDB.Positron)
+
+    # Add north arrow
+    ax.text(
+        0.98,
+        0.98,
+        "↑N",
+        transform=ax.transAxes,
+        ha="right",
+        va="top",
+        fontsize=12,
+        fontweight="bold",
+        bbox=dict(facecolor="white", edgecolor="none", alpha=0.7),
+    )
+
+    # ctx.add_scalebar(ax, location="lower right")
+
+    ax.legend(
+        handles=legend_elements,
+        loc="center left",
+        bbox_to_anchor=(1, 0.5),
+        title="Path (# of frames)",
+    )
+
+    ax.set_title("Sentinel-1 Frame Options", fontsize=16)
+    plt.tight_layout()
+    plt.savefig(outfile, dpi=300, bbox_inches="tight")
+    plt.close()
+
+    # Create summary table
+    summary_data = [
+        (path, len(results[0]), len(missing_data_options))
+        for path, (results, missing_data_options) in grouped_results.items()
+    ]
+    summary_df = pd.DataFrame(
+        summary_data, columns=["Path", "Frames", "Missing Data Options"]
+    )
+    summary_df.to_csv("sentinel_frame_summary.csv", index=False)
+    print("Summary saved to sentinel_frame_summary.csv")
+
+
 def download_cslcs(
     burst_ids: Sequence[str],
     output_dir: PathOrStr,
@@ -255,7 +432,7 @@ def filter_results_by_date_and_version(results: ASFSearchResults) -> ASFSearchRe
     Parameters
     ----------
     results : asf_search.ASFSearchResults.ASFSearchResults
-        List of ASF search results to filter.
+        list of ASF search results to filter.
 
     Returns
     -------
@@ -282,11 +459,11 @@ def filter_results_by_date_and_version(results: ASFSearchResults) -> ASFSearchRe
         for _, group in grouped_by_start_time
     ]
 
-    return filtered_results
+    return ASFSearchResults(filtered_results)
 
 
 def _get_urls(
-    results: asf.ASFSearchResults,
+    results: ASFSearchResults,
     type_: Literal["https", "s3"] = "https",
 ) -> list[str]:
     if type_ == "https":

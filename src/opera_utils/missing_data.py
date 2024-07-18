@@ -302,3 +302,28 @@ def generate_burst_subset_options(
     return sorted(
         options, key=lambda x: (x.total_num_bursts, x.num_burst_ids), reverse=True
     )
+
+
+def filter_dominated_options(
+    missing_data_options: list[BurstSubsetOption],
+) -> list[BurstSubsetOption]:
+    filtered_options = []
+    for i, option in enumerate(missing_data_options):
+        is_dominated = False
+        burst_ids = set(option.burst_ids)
+        for j, other_option in enumerate(missing_data_options):
+            if i != j:
+                other_burst_ids = set(other_option.burst_ids)
+                if (
+                    burst_ids.issubset(other_burst_ids)
+                    and option.num_dates <= other_option.num_dates
+                    and (
+                        len(burst_ids) != len(other_burst_ids)
+                        or option.num_dates != other_option.num_dates
+                    )
+                ):
+                    is_dominated = True
+                    break
+        if not is_dominated:
+            filtered_options.append(option)
+    return filtered_options
