@@ -29,7 +29,7 @@ license = { file = "LICENSE.txt" }
 # see section: setuptools_scm
 # https://setuptools.pypa.io/en/latest/userguide/pyproject_config.html#dynamic-metadata
 # dependencies will be read from text files
-dynamic = ["version", "dependencies", "optional-dependencies"]
+dynamic = ["version", "dependencies"]
 
 [project.urls]
 Homepage = "https://github.com/opera-adt/opera-utils"
@@ -45,10 +45,36 @@ opera-utils = "opera_utils.cli:cli_app"
 dependencies = { file = ["requirements.txt"] }
 
 # extra requirements: `pip install .[docs]` or `pip install .[docs]`
-[tool.setuptools.dynamic.optional-dependencies.docs]
-file = ["docs/requirements.txt"]
-[tool.setuptools.dynamic.optional-dependencies.test]
-file = ["tests/requirements.txt"]
+[project.optional-dependencies]
+geo = [
+  "asf_search",
+  "gdal",
+  "rasterio"
+]
+plot = [
+  "matplotlib-base",
+  "geopandas-base",
+]
+test = [
+  "asf_search",
+  "pre-commit",
+  "pytest",
+  "pytest-cov",
+  "pytest-randomly",
+  "pytest-recording",
+  "pytest-xdist",
+  "ruff",
+]
+docs = [
+  "mkdocs",
+  "mkdocs-gen-files",
+  "mkdocs-jupyter",
+  "mkdocs-literate-nav",
+  "mkdocs-material",
+  "mkdocs-section-index",
+  "mkdocstrings[python]",
+  "pymdown-extensions",
+]
 
 [tool.setuptools_scm]
 # https://github.com/pypa/setuptools_scm#configuration-parameters
