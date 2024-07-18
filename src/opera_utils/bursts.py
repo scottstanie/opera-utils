@@ -46,7 +46,11 @@ def get_burst_id(
         raise ValueError(f"Could not parse burst id from {filename}")
     burst_str = m.group()
     # Normalize
-    return burst_str.lower().replace("-", "_")
+    return _normalize(burst_str)
+
+
+def _normalize(burst_id_str: str) -> str:
+    return burst_id_str.lower().replace("-", "_")
 
 
 @overload

@@ -16,6 +16,7 @@ from pyproj import CRS, Transformer
 from shapely import geometry, ops, wkt
 
 from ._types import Filename
+from .bursts import _normalize
 from .constants import OPERA_IDENTIFICATION
 
 __all__ = [
@@ -88,7 +89,7 @@ def parse_filename(h5_filename: Filename) -> dict[str, str | datetime]:
 
     result = match.groupdict()
     # Normalize to lowercase / underscore
-    result["burst_id"] = result["burst_id"].lower().replace("-", "_")
+    result["burst_id"] = _normalize(result["burst_id"])
     fmt = "%Y%m%dT%H%M%SZ"
     result["start_datetime"] = datetime.strptime(result["start_datetime"], fmt).replace(
         tzinfo=timezone.utc
