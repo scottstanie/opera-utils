@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import json
 import zipfile
+from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Optional, Sequence
 
 from . import datasets
 from ._types import Bbox, PathOrStr
@@ -33,7 +33,7 @@ def read_zipped_json(filename: PathOrStr):
 
 
 def get_frame_to_burst_mapping(
-    frame_id: int, json_file: Optional[PathOrStr] = None
+    frame_id: int, json_file: PathOrStr | None = None
 ) -> dict:
     """Get the frame data for one frame ID.
 
@@ -57,37 +57,53 @@ def get_frame_to_burst_mapping(
 
 def get_frame_geojson(
     as_geodataframe: bool = False,
-    columns: Optional[Sequence[str]] = None,
-    frame_ids: Optional[Sequence[str]] = None,
+    columns: Sequence[str] | None = None,
+    frame_ids: Sequence[str] | None = None,
 ) -> dict:
     """Get the GeoJSON for the frame geometries."""
-    where = _form_where_in_query(frame_ids, "frame_id") if frame_ids else None
+    where = _form_where_in_query(frame_ids, "id") if frame_ids else None
     return _get_geojson(
         datasets.fetch_frame_geometries_simple(),
         as_geodataframe=as_geodataframe,
         columns=columns,
         where=where,
         index_name="frame_id",
+        ids=frame_ids,
     )
 
 
 def get_burst_id_geojson(
     as_geodataframe: bool = False,
-    columns: Optional[Sequence[str]] = None,
-    burst_ids: Optional[Sequence[str]] = None,
-) -> dict:
+    columns: Sequence[str] | None = None,
+    burst_ids: Sequence[str] | None = None,
+) -> list:
     """Get the GeoJSON for the burst_id geometries."""
-    where = _form_where_in_query(burst_ids, "burst_id_jpl") if burst_ids else None
-    return _get_geojson(
+    if burst_ids is None:
+        return _get_geojson(
+            datasets.fetch_burst_id_geometries_simple(),
+            as_geodataframe=as_geodataframe,
+            columns=columns,
+            index_name="burst_id_jpl",
+        )
+
+    burst_id_set = set([normalize_burst_id(b) for b in burst_ids])
+    where = _form_where_in_query(burst_id_set, "burst_id_jpl") if burst_ids else None
+    results = _get_geojson(
         datasets.fetch_burst_id_geometries_simple(),
         as_geodataframe=as_geodataframe,
         columns=columns,
         where=where,
         index_name="burst_id_jpl",
     )
+    if as_geodataframe or not burst_ids:
+        return results
+    # Manually filter using 'properties' -> 'burst_id_jpl'
+    return [
+        feat for feat in results if feat["properties"]["burst_id_jpl"] in burst_id_set
+    ]
 
 
-def _form_where_in_query(values: Sequence[str], column_name):
+def _form_where_in_query(values: Iterable[str], column_name):
     # Example:
     # "burst_id_jpl in ('t005_009471_iw2','t007_013706_iw2','t008_015794_iw1')"
     where_in_str = ",".join(f"'{b}'" for b in values)
@@ -97,10 +113,11 @@ def _form_where_in_query(values: Sequence[str], column_name):
 def _get_geojson(
     f,
     as_geodataframe: bool = False,
-    columns: Optional[Sequence[str]] = None,
-    where: Optional[str] = None,
-    index_name: Optional[str] = None,
-) -> dict:
+    columns: Sequence[str] | None = None,
+    where: str | None = None,
+    index_name: str | None = None,
+    ids: Iterable[int | str] | None = None,
+):
     # https://gdal.org/user/ogr_sql_dialect.html#where
     # https://pyogrio.readthedocs.io/en/latest/introduction.html#filter-records-by-attribute-value
     if as_geodataframe:
@@ -113,11 +130,16 @@ def _get_geojson(
             gdf.index.name = index_name
         return gdf
 
-    return read_zipped_json(f)
+    # TODO: implement feature filtering without geopandas?
+    features = read_zipped_json(f)["features"]
+    if ids is not None:
+        return [f for f in features if f["id"] in set(map(int, ids))]
+    else:
+        return features
 
 
 def get_frame_bbox(
-    frame_id: int, json_file: Optional[PathOrStr] = None
+    frame_id: int, json_file: PathOrStr | None = None
 ) -> tuple[int, Bbox]:
     """Get the bounding box of a frame from a JSON file.
 
@@ -148,7 +170,7 @@ def get_frame_bbox(
 
 
 def get_burst_ids_for_frame(
-    frame_id: int, json_file: Optional[PathOrStr] = None
+    frame_id: int, json_file: PathOrStr | None = None
 ) -> list[str]:
     """Get the burst IDs for one frame ID.
 
@@ -170,7 +192,7 @@ def get_burst_ids_for_frame(
 
 
 def get_burst_to_frame_mapping(
-    burst_id: str, json_file: Optional[PathOrStr] = None
+    burst_id: str, json_file: PathOrStr | None = None
 ) -> dict:
     """Get the burst data for one burst ID.
 
@@ -194,7 +216,7 @@ def get_burst_to_frame_mapping(
 
 
 def get_frame_ids_for_burst(
-    burst_id: str, json_file: Optional[PathOrStr] = None
+    burst_id: str, json_file: PathOrStr | None = None
 ) -> list[int]:
     """Get the frame IDs for one burst ID.
 
