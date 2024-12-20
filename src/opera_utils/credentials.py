@@ -1,7 +1,20 @@
+"""Module for handling direct S3 access to OPERA/Sentinel-1 data."""
+
 import os
 from datetime import datetime
 
 from pydantic import BaseModel, Field
+from dataclasses import dataclass
+
+
+@dataclass
+class AWSCredentials(BaseModel):
+    """Class for AWS credentials (accessKeyId, secretAccessKey, sessionToken)."""
+
+    access_key_id: str = Field(alias="accessKeyId")  # use aliases to match JSON case
+    secret_access_key: str = Field(alias="secretAccessKey")
+    session_token: str = Field(alias="sessionToken")
+    expiration: datetime | None = None
 
 
 class AWSCredentials(BaseModel):
