@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from ._cslc import *
 from ._dates import *
+from ._disp import *
 from ._helpers import *
 from ._utils import *
 from ._version import version as __version__
