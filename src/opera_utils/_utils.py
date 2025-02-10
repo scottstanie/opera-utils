@@ -4,8 +4,9 @@ import os
 import shutil
 import tempfile
 from contextlib import contextmanager
+from itertools import chain
 from pathlib import Path
-from typing import Generator
+from typing import Any, Generator, Iterable, TypeVar
 
 import numpy as np
 from numpy.typing import DTypeLike
@@ -13,8 +14,11 @@ from numpy.typing import DTypeLike
 from ._helpers import reproject_bounds, reproject_coordinates
 from ._types import Bbox, PathOrStr
 
+T = TypeVar("T")
+
 __all__ = [
     "format_nc_filename",
+    "flatten",
     "scratch_directory",
     "create_yx_arrays",
     "get_snwe",
@@ -252,3 +256,8 @@ def transform_xy_to_latlon(
         longitude = x.copy()
 
     return latitude, longitude
+
+
+def flatten(list_of_lists: Iterable[Iterable[Any]]) -> chain[Any]:
+    """Flatten one level of a nested iterable."""
+    return chain.from_iterable(list_of_lists)
