@@ -21,7 +21,7 @@ else:
 
 PathOrStr = Union[str, PathLikeStr]
 Filename = PathOrStr  # May add a deprecation notice for `Filename`
-PathLikeT = TypeVar("PathLikeT", bound=PathLikeStr)
+PathLikeT = TypeVar("PathLikeT", bound=PathOrStr)
 
 # Used for callable types
 T = TypeVar("T")

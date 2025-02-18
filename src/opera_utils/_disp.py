@@ -8,10 +8,14 @@ from pathlib import Path
 from typing import TypeVar
 
 import numpy as np
+from pyproj import Transformer
 
 from ._dates import get_dates
+from ._types import Bbox
 from ._utils import flatten
+from .burst_frame_db import get_frame_bbox
 from .constants import DISP_FILE_REGEX
+from .credentials import AWSCredentials, get_authorized_s3_client
 
 T = TypeVar("T")
 __all__ = [
@@ -112,6 +116,37 @@ def _get_first_file_per_ministack(
     return first_per_ministack
 
 
+import h5netcdf
+
+
+def get_remote_h5(url: str, page_size: int = 4 * 1024 * 1024) -> h5netcdf.File:
+    from .credentials import _get_aws_creds
+
+    secret_id, secret_key, session_token = _get_aws_creds()
+    # ROS3 driver uses weirdly different names
+    driver_kwds = dict(
+        aws_region=b"us-west-2",
+        secret_id=secret_id.encode(),
+        secret_key=secret_key.encode(),
+        session_token=session_token.encode(),
+    )
+
+    cloud_opts = dict(
+        # Set page size for cloud-optimized HDF5
+        libver="latest",
+        fs_strategy="page",
+        fs_page_size=page_size,
+        rdcc_nbytes=1024 * 1024 * 100,  # 100 MB per file
+    )
+    return h5netcdf.File(
+        url,
+        "r",
+        driver="ros3",
+        driver_kwds=driver_kwds,
+        **cloud_opts,
+    )
+
+
 class DispReader:
     """A reader for a stack of OPERA DISP-S1 files.
 
@@ -128,7 +163,8 @@ class DispReader:
     """
 
     def __init__(self, filepaths: list[str | Path], page_size: int = 4 * 1024 * 1024):
-        self.filepaths = [Path(f) for f in filepaths]
+        # self.filepaths = [Path(f) for f in filepaths]
+        self.filepaths = filepaths
         self.page_size = page_size
 
         # Parse the reference/secondary times from each file
@@ -148,19 +184,9 @@ class DispReader:
         self.date_to_idx = {d: i for i, d in enumerate(self.unique_dates)}
 
         # Open all files with h5netcdf
-        import h5netcdf.core
-
         self.datasets = []
         for f in self.filepaths:
-            ds = h5netcdf.core.File(
-                f,
-                "r",
-                decode_vlen_strings=False,
-                # Set page size for cloud-optimized HDF5
-                libver="latest",
-                fs_strategy="page",
-                fs_page_size=self.page_size,
-            )
+            ds = get_remote_h5(str(f), page_size=self.page_size)
             self.datasets.append(ds)
 
     def __getitem__(self, key):
@@ -254,3 +280,319 @@ def get_incidence_matrix(
             A[i, date_to_col[later]] = +1
 
     return A
+
+
+# ---------------------------------------------------------------------
+# New S3 dispersion reader for accessing pixel time series from S3
+# ---------------------------------------------------------------------
+
+
+class S3DispReader:
+    """
+    A reader for a stack of OPERA DISP-S1 files stored on S3.
+
+    This class provides a method to read a pixel's time series directly from S3,
+    converting the relative displacements to absolute displacements using the pseudo-inverse
+    of the incidence matrix.
+
+    Parameters
+    ----------
+    s3_bucket : str
+        The name of the S3 bucket where the files are stored.
+    s3_keys : list[str]
+        List of S3 keys (paths) to OPERA DISP-S1 files.
+    dataset : str, optional
+        The dataset name for obtaining S3 credentials. Default is "opera".
+    aws_credentials : AWSCredentials, optional
+        Pre-configured AWS credentials. If not provided, they will be obtained automatically.
+    """
+
+    def __init__(
+        self,
+        s3_bucket: str,
+        s3_keys: list[str],
+        dataset: str = "opera",
+        aws_credentials: AWSCredentials | None = None,
+    ):
+        self.s3_bucket = s3_bucket
+        # Sort keys by secondary datetime extracted from the filename
+        self.s3_keys = sorted(
+            s3_keys,
+            key=lambda key: OperaDispFile.from_filename(key).secondary_datetime,
+        )
+
+        # Parse datetimes from the filenames
+        self.ref_times, self.sec_times, _ = parse_disp_datetimes(self.s3_keys)
+        self.unique_dates = sorted(set(self.ref_times + self.sec_times))
+        ifg_pairs = list(zip(self.ref_times, self.sec_times))
+        self.incidence_matrix = get_incidence_matrix(
+            ifg_pairs, sar_idxs=self.unique_dates, delete_first_date_column=True
+        )
+        self.incidence_pinv = np.linalg.pinv(self.incidence_matrix)
+        self.date_to_idx = {d: i for i, d in enumerate(self.unique_dates)}
+
+        # Create an authorized S3 client
+        self.s3_client = get_authorized_s3_client(
+            dataset=dataset, aws_credentials=aws_credentials
+        )
+
+    def pixel_time_series(self, y: int, x: int) -> np.ndarray:
+        """
+        Read the time series for a specific pixel (y, x) from S3.
+
+        For each file (S3 key), the displacement is read from the "displacement"
+        dataset (assumed to be 2D), then the series of relative displacements is
+        transformed to absolute displacements using the pseudo-inverse of the incidence matrix.
+
+        Parameters
+        ----------
+        y : int
+            The row index of the pixel.
+        x : int
+            The column index of the pixel.
+
+        Returns
+        -------
+        np.ndarray
+            The absolute displacement time series of the pixel.
+        """
+        from io import BytesIO
+
+        import h5netcdf
+
+        pixel_values = []
+        for key in self.s3_keys:
+            response = self.s3_client.get_object(Bucket=self.s3_bucket, Key=key)
+            file_bytes = response["Body"].read()
+            # Wrap the file bytes in a BytesIO object so that h5netcdf can open it.
+            file_obj = BytesIO(file_bytes)
+            ds = h5netcdf.File(file_obj, "r", decode_vlen_strings=False)
+            # Extract the pixel value from the "displacement" dataset
+            value = ds["displacement"][y, x]
+            pixel_values.append(value)
+            ds.close()
+
+        data = np.array(pixel_values)  # Shape: (n_ifgs,)
+        # Convert from relative to absolute displacements:
+        absolute_series = np.tensordot(self.incidence_pinv, data, axes=([1], [0]))
+        return absolute_series
+
+
+def get_geospatial_metadata(frame_id: int) -> dict:
+    """
+    Get the geospatial metadata for a given frame.
+
+    This function retrieves the bounding box and EPSG code for the specified frame
+    using `get_frame_bbox`, then constructs a geotransform based on known properties:
+    - The image is always in UTM.
+    - Pixel spacing is fixed at 30 m by 30 m.
+    - The geotransform is defined as (top left x, pixel width, rotation_x, top left y, rotation_y, pixel height),
+      where the top left coordinate is (xmin, ymax) because y typically decreases downward in raster data.
+
+    Additionally, the full CRS object is constructed using pyproj.
+
+    Parameters
+    ----------
+    frame_id : int
+        The ID of the frame to get metadata for.
+
+    Returns
+    -------
+    dict
+        A dictionary containing:
+          - "crs": pyproj CRS object based on the EPSG code.
+          - "bbox": tuple of (xmin, ymin, xmax, ymax).
+          - "geotransform": tuple (top left x, pixel width, 0, top left y, 0, pixel height)
+            where pixel height is negative for a top-down image orientation.
+          - "resolution": (30, 30)
+    """
+    import pyproj
+
+    # Retrieve the EPSG and bounding box, e.g. (xmin, ymin, xmax, ymax)
+    epsg, bbox = get_frame_bbox(frame_id)
+    crs = pyproj.CRS.from_epsg(epsg)
+
+    xmin, ymin, xmax, ymax = bbox
+    # Construct the geotransform.
+    # Top left coordinate: (xmin, ymax)
+    # Pixel width: 30, and pixel height is -30 (negative because it goes downward)
+    geotransform = (xmin, 30, 0, ymax, 0, -30)
+
+    return {
+        "crs": crs,
+        "bbox": bbox,
+        "geotransform": geotransform,
+        "resolution": (30, 30),
+    }
+
+
+def utm_to_rowcol(
+    utm_x: float,
+    utm_y: float,
+    geotransform: tuple[float, float, float, float, float, float],
+) -> tuple[int, int]:
+    """
+    Convert UTM coordinates to pixel row and column indices using the provided geotransform.
+
+    Parameters
+    ----------
+    utm_x : float
+        The UTM x coordinate.
+    utm_y : float
+        The UTM y coordinate.
+    geotransform : tuple
+        Geotransform tuple of the form
+        (xmin, pixel_width, 0, ymax, 0, pixel_height),
+        where pixel_height is negative for top-down images.
+
+    Returns
+    -------
+    tuple[int, int]
+        (row, col) indices corresponding to the UTM coordinate.
+    """
+    xmin, pixel_width, _, ymax, _, pixel_height = geotransform
+    col = int(round((utm_x - xmin) / pixel_width))
+    row = int(round((ymax - utm_y) / abs(pixel_height)))
+    return row, col
+
+
+def lonlat_to_utm(lon: float, lat: float, utm_crs) -> tuple[float, float]:
+    """
+    Convert geographic coordinates (longitude, latitude) to UTM coordinates using a target CRS.
+
+    Parameters
+    ----------
+    lon : float
+        Longitude in degrees.
+    lat : float
+        Latitude in degrees.
+    utm_crs : pyproj.CRS
+        Target UTM coordinate system (typically from get_geospatial_metadata).
+
+    Returns
+    -------
+    tuple[float, float]
+        (utm_x, utm_y) coordinates.
+    """
+    transformer = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
+    utm_x, utm_y = transformer.transform(lon, lat)
+    return utm_x, utm_y
+
+
+def lonlat_to_rowcol(
+    lon: float,
+    lat: float,
+    geotransform: tuple[float, float, float, float, float, float],
+    utm_crs,
+) -> tuple[int, int]:
+    """
+    Convert geographic coordinates (lon, lat) to pixel row and column indices.
+
+    This function transforms the (lon, lat) pair to UTM
+    and then computes the corresponding pixel indices using the provided geotransform.
+
+    Parameters
+    ----------
+    lon : float
+        Longitude in degrees.
+    lat : float
+        Latitude in degrees.
+    geotransform : tuple
+        Geotransform tuple (xmin, pixel_width, 0, ymax, 0, pixel_height).
+    utm_crs : pyproj.CRS
+        Target UTM coordinate system.
+
+    Returns
+    -------
+    tuple[int, int]
+        (row, col) indices.
+    """
+    utm_x, utm_y = lonlat_to_utm(lon, lat, utm_crs)
+    return utm_to_rowcol(utm_x, utm_y, geotransform)
+
+
+def bbox_lonlat_to_utm(bbox: Bbox, utm_crs) -> Bbox:
+    """
+    Convert a bounding box in geographic coordinates (lon, lat) to UTM coordinates.
+
+    The input Bbox has attributes (left, bottom, right, top) in lon/lat.
+    The function transforms all four corners and then determines the
+    new bounding box in UTM.
+
+    Parameters
+    ----------
+    bbox : Bbox
+        Bounding box in lon/lat.
+    utm_crs : pyproj.CRS
+        Target UTM coordinate system.
+
+    Returns
+    -------
+    Bbox
+        Bounding box in UTM coordinates.
+    """
+    transformer = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
+    # Transform each corner: lower-left, upper-left, lower-right, upper-right
+    ll = transformer.transform(bbox.left, bbox.bottom)
+    lt = transformer.transform(bbox.left, bbox.top)
+    rl = transformer.transform(bbox.right, bbox.bottom)
+    rt = transformer.transform(bbox.right, bbox.top)
+    xs = [ll[0], lt[0], rl[0], rt[0]]
+    ys = [ll[1], lt[1], rl[1], rt[1]]
+    return Bbox(left=min(xs), bottom=min(ys), right=max(xs), top=max(ys))
+
+
+def bbox_utm_to_rowcol(
+    bbox: Bbox, geotransform: tuple[float, float, float, float, float, float]
+) -> tuple[int, int, int, int]:
+    """
+    Convert a bounding box in UTM coordinates to pixel row/column indices.
+
+    The provided geotransform should be of the form
+        (xmin, pixel_width, 0, ymax, 0, pixel_height)
+    with pixel_height negative for top-down orientation.
+
+    Parameters
+    ----------
+    bbox : Bbox
+        Bounding box in UTM coordinates (left, bottom, right, top).
+    geotransform : tuple
+        Geotransform tuple as described above.
+
+    Returns
+    -------
+    tuple[int, int, int, int]
+        Pixel indices as (row_min, row_max, col_min, col_max).
+    """
+    # Use the top-left corner for the minimum indices...
+    row_min, col_min = utm_to_rowcol(bbox.left, bbox.top, geotransform)
+    # ...and the bottom-right for the maximum indices.
+    row_max, col_max = utm_to_rowcol(bbox.right, bbox.bottom, geotransform)
+    return row_min, row_max, col_min, col_max
+
+
+def bbox_lonlat_to_rowcol(
+    bbox: Bbox, geotransform: tuple[float, float, float, float, float, float], utm_crs
+) -> tuple[int, int, int, int]:
+    """
+    Convert a bounding box in geographic coordinates (lon, lat) to pixel row and column indices.
+
+    This function transforms the Bbox from lon/lat to UTM using the provided target CRS,
+    then computes the pixel indices using the geotransform.
+
+    Parameters
+    ----------
+    bbox : Bbox
+        Bounding box in lon/lat (left, bottom, right, top).
+    geotransform : tuple
+        Geotransform tuple (xmin, pixel_width, 0, ymax, 0, pixel_height).
+    utm_crs : pyproj.CRS
+        Target UTM coordinate system.
+
+    Returns
+    -------
+    tuple[int, int, int, int]
+        (row_min, row_max, col_min, col_max) pixel indices.
+    """
+    utm_bbox = bbox_lonlat_to_utm(bbox, utm_crs)
+    return bbox_utm_to_rowcol(utm_bbox, geotransform)

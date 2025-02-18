@@ -4,6 +4,8 @@ from datetime import datetime, timedelta
 from typing import Iterable, Optional, Sequence
 
 import numpy as np
+from matplotlib.axes import Axes
+from matplotlib.figure import Figure
 from numpy.typing import NDArray
 
 try:
@@ -23,7 +25,7 @@ def plot_burst_id_date_incidence(
     burst_id_date_tuples: Optional[Iterable[tuple[str, datetime]]] = None,
     ax=None,
     output_file: Optional[PathOrStr] = None,
-) -> tuple[plt.figure, plt.Axes]:
+) -> tuple[Figure, Axes]:
     """Plot a matrix of burst ID vs. datetime incidence.
 
     Make a scatter plot of burst ID vs. datetime, where the x-axis spacing is uniform
