@@ -18,7 +18,7 @@ from ._types import Bbox
 from ._utils import flatten
 from .burst_frame_db import get_frame_bbox
 from .constants import DISP_FILE_REGEX
-from .credentials import AWSCredentials, get_authorized_s3_client
+from .credentials import AWSCredentials
 
 T = TypeVar("T")
 __all__ = [
@@ -182,7 +182,10 @@ class DispReader:
         aws_credentials=None,
     ):
         # self.filepaths = [Path(f) for f in filepaths]
-        self.filepaths = filepaths
+        self.filepaths = sorted(
+            filepaths,
+            key=lambda key: OperaDispFile.from_filename(key).secondary_datetime,
+        )
         self.page_size = page_size
         self.dset_name = dset_name
 
@@ -311,102 +314,6 @@ def get_incidence_matrix(
             A[i, date_to_col[later]] = +1
 
     return A
-
-
-# ---------------------------------------------------------------------
-# New S3 dispersion reader for accessing pixel time series from S3
-# ---------------------------------------------------------------------
-
-
-class S3DispReader:
-    """
-    A reader for a stack of OPERA DISP-S1 files stored on S3.
-
-    This class provides a method to read a pixel's time series directly from S3,
-    converting the relative displacements to absolute displacements using the pseudo-inverse
-    of the incidence matrix.
-
-    Parameters
-    ----------
-    s3_bucket : str
-        The name of the S3 bucket where the files are stored.
-    s3_keys : list[str]
-        List of S3 keys (paths) to OPERA DISP-S1 files.
-    dataset : str, optional
-        The dataset name for obtaining S3 credentials. Default is "opera".
-    aws_credentials : AWSCredentials, optional
-        Pre-configured AWS credentials. If not provided, they will be obtained automatically.
-    """
-
-    def __init__(
-        self,
-        s3_bucket: str,
-        s3_keys: list[str],
-        dataset: str = "opera",
-        aws_credentials: AWSCredentials | None = None,
-    ):
-        self.s3_bucket = s3_bucket
-        # Sort keys by secondary datetime extracted from the filename
-        self.s3_keys = sorted(
-            s3_keys,
-            key=lambda key: OperaDispFile.from_filename(key).secondary_datetime,
-        )
-
-        # Parse datetimes from the filenames
-        self.ref_times, self.sec_times, _ = parse_disp_datetimes(self.s3_keys)
-        self.unique_dates = sorted(set(self.ref_times + self.sec_times))
-        ifg_pairs = list(zip(self.ref_times, self.sec_times))
-        self.incidence_matrix = get_incidence_matrix(
-            ifg_pairs, sar_idxs=self.unique_dates, delete_first_date_column=True
-        )
-        self.incidence_pinv = np.linalg.pinv(self.incidence_matrix)
-        self.date_to_idx = {d: i for i, d in enumerate(self.unique_dates)}
-
-        # Create an authorized S3 client
-        self.s3_client = get_authorized_s3_client(
-            dataset=dataset, aws_credentials=aws_credentials
-        )
-
-    def pixel_time_series(self, y: int, x: int) -> np.ndarray:
-        """
-        Read the time series for a specific pixel (y, x) from S3.
-
-        For each file (S3 key), the displacement is read from the "displacement"
-        dataset (assumed to be 2D), then the series of relative displacements is
-        transformed to absolute displacements using the pseudo-inverse of the incidence matrix.
-
-        Parameters
-        ----------
-        y : int
-            The row index of the pixel.
-        x : int
-            The column index of the pixel.
-
-        Returns
-        -------
-        np.ndarray
-            The absolute displacement time series of the pixel.
-        """
-        from io import BytesIO
-
-        import h5netcdf
-
-        pixel_values = []
-        for key in self.s3_keys:
-            response = self.s3_client.get_object(Bucket=self.s3_bucket, Key=key)
-            file_bytes = response["Body"].read()
-            # Wrap the file bytes in a BytesIO object so that h5netcdf can open it.
-            file_obj = BytesIO(file_bytes)
-            ds = h5netcdf.File(file_obj, "r", decode_vlen_strings=False)
-            # Extract the pixel value from the "displacement" dataset
-            value = ds["displacement"][y, x]
-            pixel_values.append(value)
-            ds.close()
-
-        data = np.array(pixel_values)  # Shape: (n_ifgs,)
-        # Convert from relative to absolute displacements:
-        absolute_series = np.tensordot(self.incidence_pinv, data, axes=([1], [0]))
-        return absolute_series
 
 
 def get_geospatial_metadata(frame_id: int) -> dict:
