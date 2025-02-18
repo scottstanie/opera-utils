@@ -7,6 +7,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import TypeVar
 
+import h5netcdf
+import h5py
 import numpy as np
 from pyproj import Transformer
 
@@ -116,9 +118,6 @@ def _get_first_file_per_ministack(
     return first_per_ministack
 
 
-import h5netcdf
-
-
 def get_remote_h5(
     url: str,
     aws_credentials: AWSCredentials | None = None,
@@ -144,11 +143,12 @@ def get_remote_h5(
         fs_page_size=page_size,
         rdcc_nbytes=1024 * 1024 * 100,  # 100 MB per file
     )
-    return h5netcdf.File(
+    # return h5netcdf.File(
+    return h5py.File(
         url,
         "r",
         driver="ros3",
-        driver_kwds=driver_kwds,
+        **driver_kwds,
         **cloud_opts,
     )
 
