@@ -184,6 +184,7 @@ class DispReader:
         # self.filepaths = [Path(f) for f in filepaths]
         self.filepaths = filepaths
         self.page_size = page_size
+        self.dset_name = dset_name
 
         # Parse the reference/secondary times from each file
         self.ref_times, self.sec_times, _ = parse_disp_datetimes(self.filepaths)
@@ -202,11 +203,11 @@ class DispReader:
         self.date_to_idx = {d: i for i, d in enumerate(self.unique_dates)}
         self.aws_credentials = aws_credentials
         self._opened = False
+        self.datasets = []
 
     def open(self, aws_credentials=None):
         # Open all files with h5netcdf
         creds = aws_credentials or self.aws_credentials
-        self.datasets = []
         for f in tqdm(self.filepaths):
             ds = get_remote_h5(str(f), page_size=self.page_size, aws_credentials=creds)
             self.datasets.append(ds)
@@ -250,10 +251,14 @@ class DispReader:
             return transformed[time_key]
         return transformed[time_key]
 
-    def __del__(self):
+    def close(self):
         """Close all open datasets."""
         for ds in self.datasets:
             ds.close()
+        self._opened = False
+
+    def __del__(self):
+        self.close()
 
 
 def get_incidence_matrix(
