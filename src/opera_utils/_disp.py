@@ -57,39 +57,6 @@ class OperaDispFile:
         return cls(**data)  # type: ignore
 
 
-def open_stack(filenames: Sequence[Path | str]):
-    """Open a stack of files as a single xarray dataset.
-
-    Parameters
-    ----------
-    filenames : list[Filename]
-        List of filenames to open.
-
-    Returns
-    -------
-    xr.Dataset
-        The dataset containing all files.
-    """
-    import pandas as pd
-    import xarray as xr
-
-    def _prep(ds):
-        fname = ds.encoding["source"]
-        if len(ds.band) == 1:
-            ds = ds.sel(band=ds.band[0])
-
-        ref_dts, sec_dts, gen_dts = parse_disp_datetimes([fname])
-        # TODO: how should we store reference/generation times?
-        return ds.expand_dims(time=[pd.to_datetime(sec_dts[0])])
-
-    ds = xr.open_mfdataset(
-        filenames,
-        preprocess=_prep,
-        engine="rasterio",
-    )
-    return ds
-
-
 def parse_disp_datetimes(
     opera_disp_file_list: Sequence[Path | str],
 ) -> tuple[tuple[datetime], tuple[datetime], tuple[datetime]]:
