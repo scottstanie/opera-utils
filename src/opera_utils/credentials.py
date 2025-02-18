@@ -22,6 +22,14 @@ class AWSCredentials(BaseModel):
     session_token: str = Field(alias="sessionToken")
     expiration: datetime | None = None
 
+    def to_session(self) -> boto3.Session:
+        return boto3.Session(
+            aws_access_key_id=self.access_key_id,
+            aws_secret_access_key=self.secret_access_key,
+            aws_session_token=self.session_token,
+            region_name="us-west-2",
+        )
+
     def to_env(self) -> dict[str, str]:
         """Return the environment variable format of values: `AWS_`.
 
@@ -119,8 +127,13 @@ def get_aws_session(
     )
 
 
-def _get_aws_creds(dataset: str = "opera") -> tuple[str, str, str]:
-    session = get_aws_session(dataset=dataset)
+def get_frozen_credentials(
+    aws_credentials: AWSCredentials | None = None, dataset: str = "opera"
+) -> tuple[str, str, str]:
+    if aws_credentials is None:
+        session = get_aws_session(dataset=dataset)
+    else:
+        session = aws_credentials.to_session()
     current_creds = session.get_credentials()
 
     frozen_creds = current_creds.get_frozen_credentials()

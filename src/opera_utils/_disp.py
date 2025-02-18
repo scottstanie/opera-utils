@@ -120,9 +120,9 @@ import h5netcdf
 
 
 def get_remote_h5(url: str, page_size: int = 4 * 1024 * 1024) -> h5netcdf.File:
-    from .credentials import _get_aws_creds
+    from .credentials import get_frozen_credentials
 
-    secret_id, secret_key, session_token = _get_aws_creds()
+    secret_id, secret_key, session_token = get_frozen_credentials()
     # ROS3 driver uses weirdly different names
     driver_kwds = dict(
         aws_region=b"us-west-2",
