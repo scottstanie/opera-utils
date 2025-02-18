@@ -122,9 +122,6 @@ def get_remote_h5(
     )
 
 
-from typing import Literal
-
-
 class DispReader:
     """A reader for a stack of OPERA DISP-S1 files.
 
@@ -149,6 +146,7 @@ class DispReader:
             "displacement", "short_wavelength_displacement"
         ] = "displacement",
         aws_credentials=None,
+        max_concurrent: int = 50,
     ):
         # self.filepaths = [Path(f) for f in filepaths]
         self.filepaths = sorted(
@@ -157,6 +155,7 @@ class DispReader:
         )
         self.page_size = page_size
         self.dset_name = dset_name
+        self.max_concurrent = max_concurrent
 
         # Parse the reference/secondary times from each file
         self.ref_times, self.sec_times, _ = parse_disp_datetimes(self.filepaths)
