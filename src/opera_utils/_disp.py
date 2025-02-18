@@ -139,7 +139,6 @@ def get_remote_h5(
     cloud_opts = dict(
         # Set page size for cloud-optimized HDF5
         libver="latest",
-        fs_strategy="page",
         fs_page_size=page_size,
         rdcc_nbytes=1024 * 1024 * 100,  # 100 MB per file
     )
