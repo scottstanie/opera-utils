@@ -11,6 +11,7 @@ import h5netcdf
 import h5py
 import numpy as np
 from pyproj import Transformer
+from tqdm.auto import tqdm
 
 from ._dates import get_dates
 from ._types import Bbox
@@ -152,6 +153,9 @@ def get_remote_h5(
     )
 
 
+from typing import Literal
+
+
 class DispReader:
     """A reader for a stack of OPERA DISP-S1 files.
 
@@ -167,7 +171,16 @@ class DispReader:
         Page size in bytes for HDF5 file system page strategy. Default is 4 MB.
     """
 
-    def __init__(self, filepaths: list[str | Path], page_size: int = 4 * 1024 * 1024):
+    def __init__(
+        self,
+        filepaths: list[str | Path],
+        page_size: int = 4 * 1024 * 1024,
+        # TODO: refactor, get full list
+        dset_name: Literal[
+            "displacement", "short_wavelength_displacement"
+        ] = "displacement",
+        aws_credentials=None,
+    ):
         # self.filepaths = [Path(f) for f in filepaths]
         self.filepaths = filepaths
         self.page_size = page_size
@@ -187,12 +200,17 @@ class DispReader:
 
         # Create a mapping of dates to indices for the time dimension
         self.date_to_idx = {d: i for i, d in enumerate(self.unique_dates)}
+        self.aws_credentials = aws_credentials
+        self._opened = False
 
+    def open(self, aws_credentials=None):
         # Open all files with h5netcdf
+        creds = aws_credentials or self.aws_credentials
         self.datasets = []
-        for f in self.filepaths:
-            ds = get_remote_h5(str(f), page_size=self.page_size)
+        for f in tqdm(self.filepaths):
+            ds = get_remote_h5(str(f), page_size=self.page_size, aws_credentials=creds)
             self.datasets.append(ds)
+        self._opened = True
 
     def __getitem__(self, key):
         """Get a slice of data from the stack.
@@ -207,6 +225,9 @@ class DispReader:
         np.ndarray
             Data transformed from relative to absolute displacements.
         """
+        if not self._opened:
+            print("Not opened yet, running...")
+            self.open()
         # Get the time slice/index
         if isinstance(key, tuple):
             time_key = key[0]
@@ -218,7 +239,7 @@ class DispReader:
         # Read the data from each file
         data = []
         for ds in self.datasets:
-            data.append(ds["displacement"][spatial_key])
+            data.append(ds[self.dset_name][spatial_key])
         data = np.stack(data)
 
         # Transform from relative to absolute displacements
