@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import asyncio
 import itertools
 from collections.abc import Sequence
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, TypeVar
+from typing import TypeVar
 
 import h5netcdf
 import h5py
@@ -173,57 +171,30 @@ class DispReader:
         self._opened = False
         self.datasets = []
 
-    async def _load_file(self, filepath: str | Path) -> None:
-        """Load a single HDF5 file asynchronously."""
-        # Run get_remote_h5 in a thread pool since it's a blocking operation
-        loop = asyncio.get_event_loop()
-        with ThreadPoolExecutor() as pool:
-            ds = await loop.run_in_executor(
-                pool,
-                lambda: get_remote_h5(
-                    str(filepath),
-                    page_size=self.page_size,
-                    aws_credentials=self.aws_credentials,
-                ),
-            )
-            self.datasets.append(ds)
-
-    async def open(self, aws_credentials=None):
-        """Asynchronously open all files using a semaphore to limit concurrent operations."""
-        if self._opened:
-            return
-
+    def open(self, aws_credentials=None):
+        # Open all files with h5netcdf
         creds = aws_credentials or self.aws_credentials
-        self.aws_credentials = creds
-
-        # Create a semaphore to limit concurrent operations
-        semaphore = asyncio.Semaphore(self.max_concurrent)
-
-        async def load_with_semaphore(filepath):
-            async with semaphore:
-                await self._load_file(filepath)
-
-        # Create tasks for all files
-        tasks = [load_with_semaphore(f) for f in self.filepaths]
-
-        # Use tqdm to show progress
-        for f in tqdm(
-            asyncio.as_completed(tasks), total=len(tasks), desc="Loading files"
-        ):
-            await f
-
+        for f in tqdm(self.filepaths):
+            ds = get_remote_h5(str(f), page_size=self.page_size, aws_credentials=creds)
+            self.datasets.append(ds)
         self._opened = True
 
     def __getitem__(self, key):
-        """Synchronous version of data access. For better performance, use aget instead."""
-        return asyncio.run(self.aget(key))
+        """Get a slice of data from the stack.
 
-    async def aget(self, key):
-        """Asynchronously get a slice of data from the stack."""
+        Parameters
+        ----------
+        key : tuple[slice | int]
+            Tuple of slices/indices into (time, y, x) dimensions.
+
+        Returns
+        -------
+        np.ndarray
+            Data transformed from relative to absolute displacements.
+        """
         if not self._opened:
             print("Not opened yet, running...")
-            await self.open()
-
+            self.open()
         # Get the time slice/index
         if isinstance(key, tuple):
             time_key = key[0]
@@ -232,19 +203,10 @@ class DispReader:
             time_key = key
             spatial_key = (slice(None), slice(None))
 
-        # Read the data from each file asynchronously
-        loop = asyncio.get_event_loop()
-        with ThreadPoolExecutor() as pool:
-            # Create tasks for reading data from each dataset
-            tasks = [
-                loop.run_in_executor(
-                    pool, lambda ds=ds: ds[self.dset_name][spatial_key]
-                )
-                for ds in self.datasets
-            ]
-            # Wait for all reads to complete
-            data = await asyncio.gather(*tasks)
-
+        # Read the data from each file
+        data = []
+        for ds in self.datasets:
+            data.append(ds[self.dset_name][spatial_key])
         data = np.stack(data)
 
         # Transform from relative to absolute displacements
@@ -255,24 +217,11 @@ class DispReader:
             return transformed[time_key]
         return transformed[time_key]
 
-    async def aclose(self):
-        """Asynchronously close all open datasets."""
-        if not self._opened:
-            return
-
-        # Create a thread pool for closing operations
-        loop = asyncio.get_event_loop()
-        with ThreadPoolExecutor() as pool:
-            # Close all datasets concurrently
-            await asyncio.gather(
-                *[loop.run_in_executor(pool, ds.close) for ds in self.datasets]
-            )
-        self.datasets = []
-        self._opened = False
-
     def close(self):
-        """Synchronous wrapper for aclose."""
-        asyncio.run(self.aclose())
+        """Close all open datasets."""
+        for ds in self.datasets:
+            ds.close()
+        self._opened = False
 
     def __del__(self):
         self.close()
