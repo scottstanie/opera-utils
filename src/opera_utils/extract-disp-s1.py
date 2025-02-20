@@ -1,30 +1,38 @@
+#!/usr/bin/env python
+# /// script
+# dependencies = ["opera-utils", "h5py", "numpy", "pyproj", "tqdm"]
+# ///
 from __future__ import annotations
 
-import itertools
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, TypeVar
 
-import h5netcdf
 import h5py
 import numpy as np
 from pyproj import Transformer
 from tqdm.auto import tqdm
 
-from ._dates import get_dates
-from ._types import Bbox
-from ._utils import flatten
-from .burst_frame_db import get_frame_bbox
-from .constants import DISP_FILE_REGEX
-from .credentials import AWSCredentials
+from opera_utils import Bbox, flatten, get_dates, get_frame_bbox
 
 T = TypeVar("T")
-__all__ = [
-    "OperaDispFile",
-    "parse_disp_datetimes",
-]
+
+
+# OPERA_L3_DISP-S1_IW_F11116_VV_20160705T140755Z_20160729T140756Z_v1.0_20241219T231545Z.nc
+DISP_FILE_REGEX = re.compile(
+    "OPERA_L3_DISP-"
+    r"(?P<sensor>(S1|NI))_"
+    r"(?P<acquisition_mode>IW)_"  # TODO: What's NISAR's?
+    r"F(?P<frame_id>\d{5})_"
+    r"(?P<polarization>(VV|HH))_"
+    r"(?P<reference_datetime>\d{8}T\d{6}Z)_"
+    r"(?P<secondary_datetime>\d{8}T\d{6}Z)_"
+    r"v(?P<version>[\d.]+)_"
+    r"(?P<generation_datetime>\d{8}T\d{6}Z)",
+)
 
 
 @dataclass
@@ -70,53 +78,6 @@ def parse_disp_datetimes(
     return reference_times, secondary_times, generation_times
 
 
-def _get_first_file_per_ministack(
-    opera_file_list: Sequence[Path | str],
-) -> list[Path | str]:
-    def _get_generation_time(fname):
-        return parse_disp_datetimes([fname])[2][0]
-
-    first_per_ministack = []
-    for d, cur_groupby in itertools.groupby(
-        sorted(opera_file_list), key=_get_generation_time
-    ):
-        # cur_groupby is an iterable of all matching
-        # Get the first one
-        first_per_ministack.append(next(cur_groupby))
-    return first_per_ministack
-
-
-def get_remote_h5(
-    url: str,
-    aws_credentials: AWSCredentials | None = None,
-    page_size: int = 4 * 1024 * 1024,
-    rdcc_nbytes=1024 * 1024 * 100,
-) -> h5netcdf.File:
-    from .credentials import get_frozen_credentials
-
-    secret_id, secret_key, session_token = get_frozen_credentials(
-        aws_credentials=aws_credentials
-    )
-    # ROS3 driver uses weirdly different names
-    ros3_kwargs = dict(
-        aws_region=b"us-west-2",
-        secret_id=secret_id.encode(),
-        secret_key=secret_key.encode(),
-        session_token=session_token.encode(),
-    )
-
-    # Set page size for cloud-optimized HDF5
-    cloud_kwargs = dict(fs_page_size=page_size, rdcc_nbytes=rdcc_nbytes)
-    # return h5netcdf.File(
-    return h5py.File(
-        url,
-        "r",
-        driver="ros3",
-        **ros3_kwargs,
-        **cloud_kwargs,
-    )
-
-
 class DispReader:
     """A reader for a stack of OPERA DISP-S1 files.
 
@@ -135,27 +96,17 @@ class DispReader:
     def __init__(
         self,
         filepaths: list[str | Path],
-        page_size: int = 4 * 1024 * 1024,
         # TODO: refactor, get full list
         dset_name: Literal[
             "displacement", "short_wavelength_displacement"
-        ] = "displacement",
-        aws_credentials=None,
-        max_concurrent: int = 50,
+        ] = "short_wavelength_displacement",
     ):
-        # self.filepaths = [Path(f) for f in filepaths]
         self.filepaths = sorted(
             filepaths,
             key=lambda key: OperaDispFile.from_filename(key).secondary_datetime,
         )
-        self._is_s3 = "s3://" in filepaths[0]
-        # TODO: provide the formatting like
-        # 'HDF5:"/vsicurl/https://datapool...OPERA_...240Z.nc"://displacement'
-        self._is_http = "http:" in filepaths[0]
 
-        self.page_size = page_size
         self.dset_name = dset_name
-        self.max_concurrent = max_concurrent
 
         # Parse the reference/secondary times from each file
         self.ref_times, self.sec_times, _ = parse_disp_datetimes(self.filepaths)
@@ -171,27 +122,14 @@ class DispReader:
         self.incidence_pinv = np.linalg.pinv(self.incidence_matrix)
 
         # Create a mapping of dates to indices for the time dimension
-        self.date_to_idx = {d: i for i, d in enumerate(self.unique_dates)}
-        self.aws_credentials = aws_credentials
         self._opened = False
-        self.datasets = []
+        self._h5py_files: list[h5py.File] = []
 
-    def open(self, aws_credentials=None):
-        # Open all files with h5netcdf
-        if self._is_s3:
-            creds = aws_credentials or self.aws_credentials
-            for f in tqdm(self.filepaths):
-                ds = get_remote_h5(
-                    str(f), page_size=self.page_size, aws_credentials=creds
-                )
-                self.datasets.append(ds)
-        elif self._is_http:
-            from osgeo import gdal
-
-            for f in tqdm(self.filepaths):
-                ds = gdal.Open(f)
-                self.datasets.append(ds)
-
+    def open(self):
+        """Open all files with h5py."""
+        for f in tqdm(self.filepaths):
+            hf = h5py.File(f)
+            self._h5py_files.append(hf)
         self._opened = True
 
     def __getitem__(self, key):
@@ -208,34 +146,25 @@ class DispReader:
             Data transformed from relative to absolute displacements.
         """
         if not self._opened:
-            print("Not opened yet, running...")
             self.open()
         # Get the time slice/index
-        if isinstance(key, tuple):
-            time_key = key[0]
-            spatial_key = key[1:]
-        else:
-            time_key = key
-            spatial_key = (slice(None), slice(None))
+        time, rows, cols = key
 
         # Read the data from each file
         data = []
-        for ds in self.datasets:
-            data.append(ds[self.dset_name][spatial_key])
+        for hf in self._h5py_files:
+            data.append(hf[self.dset_name][rows, cols])
         data = np.stack(data)
 
-        # Transform from relative to absolute displacements
-        # transformed = np.tensordot(self.incidence_pinv, data, axes=([1], [0]))
+        # Reconstruct single-reference time series from moving reference date
         transformed = self.incidence_pinv @ data
 
         # Return the requested time slice
-        if isinstance(time_key, slice):
-            return transformed[time_key]
-        return transformed[time_key]
+        return transformed
 
     def close(self):
         """Close all open datasets."""
-        for ds in self.datasets:
+        for ds in self._h5py_files:
             ds.close()
         self._opened = False
 
