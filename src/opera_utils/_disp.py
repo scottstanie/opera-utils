@@ -92,6 +92,7 @@ def get_remote_h5(
     url: str,
     aws_credentials: AWSCredentials | None = None,
     page_size: int = 4 * 1024 * 1024,
+    rdcc_nbytes=1024 * 1024 * 100,
 ) -> h5netcdf.File:
     from .credentials import get_frozen_credentials
 
@@ -99,26 +100,22 @@ def get_remote_h5(
         aws_credentials=aws_credentials
     )
     # ROS3 driver uses weirdly different names
-    driver_kwds = dict(
+    ros3_kwargs = dict(
         aws_region=b"us-west-2",
         secret_id=secret_id.encode(),
         secret_key=secret_key.encode(),
         session_token=session_token.encode(),
     )
 
-    cloud_opts = dict(
-        # Set page size for cloud-optimized HDF5
-        libver="latest",
-        fs_page_size=page_size,
-        rdcc_nbytes=1024 * 1024 * 100,  # 100 MB per file
-    )
+    # Set page size for cloud-optimized HDF5
+    cloud_kwargs = dict(fs_page_size=page_size, rdcc_nbytes=rdcc_nbytes)
     # return h5netcdf.File(
     return h5py.File(
         url,
         "r",
         driver="ros3",
-        **driver_kwds,
-        **cloud_opts,
+        **ros3_kwargs,
+        **cloud_kwargs,
     )
 
 
