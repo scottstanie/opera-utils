@@ -1,6 +1,7 @@
 #!/usr/bin/env python
+
 # /// script
-# dependencies = ["opera-utils", "h5py", "numpy", "pyproj", "tqdm"]
+# dependencies = ["opera-utils", "h5py", "numpy", "pyproj", "tqdm", "tyro"]
 # ///
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ from typing import Literal, TypeVar
 
 import h5py
 import numpy as np
+import tyro
 from pyproj import Transformer
 from tqdm.auto import tqdm
 
@@ -89,8 +91,6 @@ class DispReader:
     ----------
     filepaths : list[str | Path]
         List of paths to OPERA DISP-S1 files to read.
-    page_size : int, optional
-        Page size in bytes for HDF5 file system page strategy. Default is 4 MB.
     """
 
     def __init__(
@@ -127,7 +127,7 @@ class DispReader:
 
     def open(self):
         """Open all files with h5py."""
-        for f in tqdm(self.filepaths):
+        for f in tqdm(self.filepaths, desc="Opening files"):
             hf = h5py.File(f)
             self._h5py_files.append(hf)
         self._opened = True
@@ -152,7 +152,7 @@ class DispReader:
 
         # Read the data from each file
         data = []
-        for hf in self._h5py_files:
+        for hf in tqdm(self._h5py_files, desc="Reading data"):
             data.append(hf[self.dset_name][rows, cols])
         data = np.stack(data)
 
@@ -442,3 +442,89 @@ def bbox_lonlat_to_rowcol(
     """
     utm_bbox = bbox_lonlat_to_utm(bbox, utm_crs)
     return bbox_utm_to_rowcol(utm_bbox, geotransform)
+
+
+# -------------------------
+# Command-line Interface
+# -------------------------
+
+
+def extract(
+    files: list[Path],
+    output: Path = Path("output.npy"),
+    layer: Literal[
+        "displacement", "short_wavelength_displacement"
+    ] = "short_wavelength_displacement",
+    format: Literal["npy", "csv"] = "npy",
+    rowcol: tuple[int, int] | None = None,
+    latlon: tuple[float, float] | None = None,
+) -> None:
+    """
+    Extract data from input files and save to output file.
+
+    Parameters
+    ----------
+    files : list of Path
+        One or more input file paths.
+    output : Path, optional
+        Output file path (.npy or .csv). Default is Path("output.npy").
+    layer : str, choices = { "displacement", "short_wavelength_displacement"}
+        HDF5 layer to read pixels from.
+        Default is "short_wavelength_displacement".
+    format : {"npy", "csv"}, optional
+        Output format. Default is "npy".
+    rowcol : tuple of int, optional
+        Pixel coordinates as (row, col) if using pixel indexing.
+    latlon : tuple of float, optional
+        Geographic coordinates as (lat, lon) if using geographic coordinates.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    ValueError
+        If neither or both rowcol and latlon are specified.
+
+    Notes
+    -----
+    This function extracts data from the input files based on either pixel
+    coordinates (rowcol) or geographic coordinates (latlon), and saves the
+    result to the specified output file in the chosen format.
+    """
+    # Validate coordinate input:
+    if rowcol is not None and latlon is not None:
+        raise ValueError("Specify either rowcol or latlon, not both.")
+    if rowcol is None and latlon is None:
+        raise ValueError("Must specify either rowcol or latlon.")
+
+    # Determine row and column indices
+    if latlon is not None:
+        # Use metadata from the first file to convert lat/lon to row/col.
+        first_file = files[0]
+        op_file = OperaDispFile.from_filename(first_file)
+        metadata = get_geospatial_metadata(op_file.frame_id)
+        geotransform = metadata["geotransform"]
+        utm_crs = metadata["crs"]
+        row, col = lonlat_to_rowcol(latlon[1], latlon[0], geotransform, utm_crs)
+    else:
+        row, col = rowcol
+
+    disp_reader = DispReader(filepaths=files, dset_name=layer)
+    try:
+        time_series = disp_reader[:, row, col]
+    finally:
+        disp_reader.close()
+
+    # Save the extracted time series.
+    if format == "npy":
+        np.save(output, time_series)
+        print(f"Saved time series to {output} as a NumPy binary file.")
+    elif format == "csv":
+        np.savetxt(output, time_series, delimiter=",")
+        print(f"Saved time series to {output} as CSV.")
+
+
+if __name__ == "__main__":
+    tyro.cli(extract)
