@@ -62,7 +62,17 @@ def main():
     data = reader[:, row : row + 1, col : col + 1]
     print(f"Read data shape {data.shape} in {time.time() - t0:.2f} seconds")
 
+    t0 = time.time()
+    data = reader[:, row + 10 : row + 10 + 1, col + 10 : col + 10 + 1]
+    print(f"Read data shape {data.shape} in {time.time() - t0:.2f} seconds")
+
+    t0 = time.time()
+    data = reader[:, row + 100 : row + 100 + 1, col : col + 1]
+    print(f"Read data shape {data.shape} in {time.time() - t0:.2f} seconds")
+
     reader.close()
+    date_strs = [d.strftime("%Y-%m-%d") for d in reader.unique_dates[1:]]
+    # pd.DataFrame(data=data)
 
 
 if __name__ == "__main__":

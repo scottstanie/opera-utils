@@ -545,7 +545,9 @@ def worker_process(
     """
     print(f"Worker {worker_id} started", file=sys.stderr)
 
-    h5_file = None
+    # Keep a cache of open file handles
+    open_files = {}
+
     while True:
         try:
             # Get a task from the queue
@@ -553,34 +555,63 @@ def worker_process(
 
             # None is the sentinel value to stop the worker
             if task is None:
-                print(f"Worker {worker_id} shutting down", file=sys.stderr)
+                print(
+                    f"Worker {worker_id} shutting down, closing {len(open_files)} files",
+                    file=sys.stderr,
+                )
+                # Close all open files
+                for url, h5_file in open_files.items():
+                    try:
+                        h5_file.close()
+                    except:
+                        pass
                 break
+
+            # Check if it's a command to close specific file
+            if isinstance(task, tuple) and len(task) >= 1 and task[0] == "close_file":
+                _, url = task
+                if url in open_files:
+                    try:
+                        open_files[url].close()
+                        del open_files[url]
+                        print(f"Worker {worker_id} closed file {url}", file=sys.stderr)
+                    except Exception as e:
+                        print(
+                            f"Worker {worker_id} error closing file {url}: {str(e)}",
+                            file=sys.stderr,
+                        )
+                continue
 
             job_id, url, dset_name, spatial_key = task
 
             try:
-                if h5_file is None:
-                    # Open the H5 file, read data, and close immediately
-                    h5_file = get_remote_h5(
+                # Check if file is already open
+                if url not in open_files:
+                    # Open the H5 file and keep it in the cache
+                    open_files[url] = get_remote_h5(
                         url, page_size=page_size, aws_credentials=aws_credentials
                     )
-                if h5_file is not None:
-                    data = h5_file[dset_name][spatial_key]
-                    result_queue.put((job_id, data))
-                else:
-                    continue
+
+                # Read the data from the cached file
+                data = open_files[url][dset_name][spatial_key]
+                result_queue.put((job_id, data))
             except Exception as e:
                 print(
                     f"Worker {worker_id} error on file {url}: {str(e)}", file=sys.stderr
                 )
+                # Try to close and remove the file if it caused an error
+                if url in open_files:
+                    try:
+                        open_files[url].close()
+                    except:
+                        pass
+                    del open_files[url]
                 result_queue.put((job_id, f"Error reading {url}: {str(e)}"))
 
         except Exception as e:
             print(f"Worker {worker_id} unexpected error: {str(e)}", file=sys.stderr)
             # In case of unexpected error, continue running
             continue
-        if h5_file is not None:
-            h5_file.close()
 
 
 class DispReaderPool:
@@ -702,25 +733,55 @@ class DispReaderPool:
             time_key = key
             spatial_key = (slice(None), slice(None))
 
-        # Submit tasks to worker processes
-        # TODO: the `time_key` should just filter out some of these filepaths
-        for i, url in enumerate(self.filepaths):
-            self.task_queue.put((i, str(url), self.dset_name, spatial_key))
-
-        # Collect results with progress tracking
+        # Use streaming approach - submit initial batch, then submit more as results arrive
         results = [None] * len(self.filepaths)
-        for _ in tqdm(range(len(self.filepaths)), desc="Reading data"):
-            job_id, data = self.result_queue.get()
-            if isinstance(data, str):  # Error message
-                raise RuntimeError(f"Error processing file {job_id}: {data}")
-            results[job_id] = data
+        submitted = 0
+        received = 0
+        total = len(self.filepaths)
+
+        # Submit initial batch (2x worker count to ensure workers stay busy)
+        initial_batch = min(self.max_concurrent * 2, total)
+        for i in range(initial_batch):
+            self.task_queue.put(
+                (i, str(self.filepaths[i]), self.dset_name, spatial_key)
+            )
+            submitted += 1
+
+        # Process results and submit new tasks as they complete
+        with tqdm(total=total, desc="Reading data") as pbar:
+            while received < total:
+                # Get a result
+                job_id, data = self.result_queue.get()
+                received += 1
+
+                if isinstance(data, str):  # Error message
+                    raise RuntimeError(f"Error processing file {job_id}: {data}")
+
+                results[job_id] = data
+                pbar.update(1)
+
+                # Submit a new task if there are more to process
+                if submitted < total:
+                    self.task_queue.put(
+                        (
+                            submitted,
+                            str(self.filepaths[submitted]),
+                            self.dset_name,
+                            spatial_key,
+                        )
+                    )
+                    submitted += 1
 
         # Stack the results
         data = np.stack(results)
-        cur_shape = data.shape
 
         # Transform from relative to absolute displacements
-        return (self.incidence_pinv @ data.reshape(cur_shape[0], -1)).reshape(cur_shape)
+        transformed = self.incidence_pinv @ data
+
+        # Return the requested time slice
+        if isinstance(time_key, slice):
+            return transformed[time_key]
+        return transformed[time_key]
 
     def close(self):
         """Close all worker processes and clean up resources."""
@@ -733,7 +794,7 @@ class DispReaderPool:
 
         # Wait for workers to finish
         for p in self.workers:
-            p.join(timeout=1.0)
+            p.join(timeout=2.0)
             if p.is_alive():
                 p.terminate()
 
@@ -741,6 +802,21 @@ class DispReaderPool:
         self.workers = []
         self._opened = False
         print("All worker processes stopped")
+
+    def close_file(self, url):
+        """Close a specific file across all workers.
+
+        Parameters
+        ----------
+        url : str
+            URL of the file to close
+        """
+        if not self._opened:
+            return
+
+        # Send close command to all workers
+        for _ in range(len(self.workers)):
+            self.task_queue.put(("close_file", url))
 
     def __del__(self):
         self.close()
