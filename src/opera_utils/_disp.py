@@ -513,3 +513,302 @@ def bbox_lonlat_to_rowcol(
     """
     utm_bbox = bbox_lonlat_to_utm(bbox, utm_crs)
     return bbox_utm_to_rowcol(utm_bbox, geotransform)
+
+
+import multiprocessing as mp
+from multiprocessing import Process, Queue
+from pathlib import Path
+import numpy as np
+from typing import Literal, Dict, Any, Optional, Union, List
+from tqdm.auto import tqdm
+import time
+import sys
+
+
+def worker_process(
+    task_queue: mp.Queue,
+    result_queue: mp.Queue,
+    worker_id: int,
+    aws_credentials: Dict[str, Any],
+    page_size: int,
+):
+    """Worker process to read data from remote H5 files.
+
+    Parameters
+    ----------
+    task_queue : mp.Queue
+        Queue for receiving tasks from the main process
+    result_queue : mp.Queue
+        Queue for sending results back to the main process
+    worker_id : int
+        Unique ID for this worker
+    aws_credentials : Dict[str, Any]
+        AWS credentials for accessing S3
+    page_size : int
+        Page size for HDF5 file system page strategy
+    """
+    print(f"Worker {worker_id} started", file=sys.stderr)
+
+    while True:
+        try:
+            # Get a task from the queue
+            task = task_queue.get()
+
+            # None is the sentinel value to stop the worker
+            if task is None:
+                print(f"Worker {worker_id} shutting down", file=sys.stderr)
+                break
+
+            job_id, url, dset_name, spatial_key = task
+
+            try:
+                # Open the H5 file, read data, and close immediately
+                h5_file = get_remote_h5(
+                    url, page_size=page_size, aws_credentials=aws_credentials
+                )
+                data = h5_file[dset_name][spatial_key]
+                h5_file.close()
+                result_queue.put((job_id, data))
+            except Exception as e:
+                print(
+                    f"Worker {worker_id} error on file {url}: {str(e)}", file=sys.stderr
+                )
+                result_queue.put((job_id, f"Error reading {url}: {str(e)}"))
+
+        except Exception as e:
+            print(f"Worker {worker_id} unexpected error: {str(e)}", file=sys.stderr)
+            # In case of unexpected error, continue running
+            continue
+
+
+class DispReaderPool:
+    """A reader for a stack of OPERA DISP-S1 files with multiprocessing support.
+
+    Parameters
+    ----------
+    filepaths : list[str | Path]
+        List of paths to OPERA DISP-S1 files to read.
+    page_size : int, optional
+        Page size in bytes for HDF5 file system page strategy. Default is 4 MB.
+    dset_name : Literal["displacement", "short_wavelength_displacement"], optional
+        Name of the dataset to read. Default is "displacement".
+    aws_credentials : Dict[str, Any], optional
+        AWS credentials for accessing S3.
+    max_concurrent : int, optional
+        Maximum number of worker processes to use. Default is 4.
+    """
+
+    def __init__(
+        self,
+        filepaths: List[str | Path],
+        page_size: int = 4 * 1024 * 1024,
+        dset_name: Literal[
+            "displacement", "short_wavelength_displacement"
+        ] = "displacement",
+        aws_credentials=None,
+        max_concurrent: int = 4,
+    ):
+        # Sort filepaths by secondary datetime
+        self.filepaths = sorted(
+            filepaths,
+            key=lambda key: OperaDispFile.from_filename(key).secondary_datetime,
+        )
+        self._is_s3 = "s3://" in str(filepaths[0])
+        self._is_http = "http:" in str(filepaths[0])
+
+        self.page_size = page_size
+        self.dset_name = dset_name
+        self.max_concurrent = max_concurrent
+        self.aws_credentials = aws_credentials
+
+        # Parse the reference/secondary times from each file
+        self.ref_times, self.sec_times, _ = parse_disp_datetimes(self.filepaths)
+        # Get the unique dates in chronological order
+        self.unique_dates = sorted(set(self.ref_times + self.sec_times))
+
+        # Create the incidence matrix for the full stack
+        ifg_pairs = list(zip(self.ref_times, self.sec_times))
+        self.incidence_matrix = get_incidence_matrix(
+            ifg_pairs, sar_idxs=self.unique_dates, delete_first_date_column=True
+        )
+        self.incidence_pinv = np.linalg.pinv(self.incidence_matrix)
+
+        # Create a mapping of dates to indices for the time dimension
+        self.date_to_idx = {d: i for i, d in enumerate(self.unique_dates)}
+
+        # Initialize multiprocessing resources
+        self.task_queue = mp.Queue()
+        self.result_queue = mp.Queue()
+        self.workers = []
+        self._opened = False
+
+    def open(self, aws_credentials=None):
+        """Start worker processes for parallel reading.
+
+        Parameters
+        ----------
+        aws_credentials : Dict[str, Any], optional
+            AWS credentials for accessing S3. If not provided, uses the credentials
+            specified during initialization.
+        """
+        if self._opened:
+            return
+
+        # Make sure credentials are set
+        self.aws_credentials = aws_credentials or self.aws_credentials
+
+        # Start worker processes
+        for i in range(self.max_concurrent):
+            p = Process(
+                target=worker_process,
+                args=(
+                    self.task_queue,
+                    self.result_queue,
+                    i,
+                    self.aws_credentials,
+                    self.page_size,
+                ),
+            )
+            p.daemon = True
+            p.start()
+            self.workers.append(p)
+
+        self._opened = True
+        print(f"Started {len(self.workers)} worker processes for parallel reading")
+
+    def __getitem__(self, key):
+        """Get a slice of data from the stack using worker processes.
+
+        Parameters
+        ----------
+        key : tuple[slice | int]
+            Tuple of slices/indices into (time, y, x) dimensions.
+
+        Returns
+        -------
+        np.ndarray
+            Data transformed from relative to absolute displacements.
+        """
+        if not self._opened:
+            self.open()
+
+        # Extract time and spatial keys
+        if isinstance(key, tuple):
+            time_key = key[0]
+            spatial_key = key[1:]
+        else:
+            time_key = key
+            spatial_key = (slice(None), slice(None))
+
+        # Submit tasks to worker processes
+        for i, url in enumerate(self.filepaths):
+            self.task_queue.put((i, str(url), self.dset_name, spatial_key))
+
+        # Collect results with progress tracking
+        results = [None] * len(self.filepaths)
+        for _ in tqdm(range(len(self.filepaths)), desc="Reading data"):
+            job_id, data = self.result_queue.get()
+            if isinstance(data, str):  # Error message
+                raise RuntimeError(f"Error processing file {job_id}: {data}")
+            results[job_id] = data
+
+        # Stack the results
+        data = np.stack(results)
+
+        # Transform from relative to absolute displacements
+        transformed = self.incidence_pinv @ data
+
+        # Return the requested time slice
+        if isinstance(time_key, slice):
+            return transformed[time_key]
+        return transformed[time_key]
+
+    def close(self):
+        """Close all worker processes and clean up resources."""
+        if not self._opened:
+            return
+
+        # Send sentinel values to stop workers
+        for _ in range(len(self.workers)):
+            self.task_queue.put(None)
+
+        # Wait for workers to finish
+        for p in self.workers:
+            p.join(timeout=1.0)
+            if p.is_alive():
+                p.terminate()
+
+        # Clean up
+        self.workers = []
+        self._opened = False
+        print("All worker processes stopped")
+
+    def __del__(self):
+        self.close()
+
+
+def main():
+    """Example usage of the parallel DispReader."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Read OPERA DISP-S1 files in parallel")
+    parser.add_argument(
+        "url_file",
+        type=str,
+        help="File containing S3 URLs to OPERA DISP-S1 files, one per line",
+    )
+    parser.add_argument(
+        "--max-concurrent",
+        type=int,
+        default=8,
+        help="Maximum number of worker processes to use",
+    )
+    parser.add_argument(
+        "--page-size",
+        type=int,
+        default=4 * 1024 * 1024,
+        help="Page size in bytes for HDF5 file system page strategy",
+    )
+    args = parser.parse_args()
+
+    # Read URLs from file
+    with open(args.url_file, "r") as f:
+        urls = [line.strip() for line in f if line.strip()]
+
+    print(f"Found {len(urls)} URLs to process")
+
+    # Create AWS credentials
+    from .credentials import AWSCredentials
+
+    aws_credentials = AWSCredentials()
+
+    # Create and use the reader
+    t0 = time.time()
+    reader = DispReaderPool(
+        urls,
+        page_size=args.page_size,
+        max_concurrent=args.max_concurrent,
+        aws_credentials=aws_credentials,
+    )
+    print(f"Created in in {time.time() - t0:.2f} seconds")
+
+    t0 = time.time()
+    reader.open()
+    print(f".open() run in {time.time() - t0:.2f} seconds")
+    # Example: Read slices of data
+    t0 = time.time()
+    data = reader[:, 100:200, 100:200]
+    print(f"Read data shape {data.shape} in {time.time() - t0:.2f} seconds")
+
+    t0 = time.time()
+    data = reader[:, 1000:1100, 1100:1200]
+    print(f"Read data shape {data.shape} in {time.time() - t0:.2f} seconds")
+
+    t0 = time.time()
+    data = reader[:, 5000:5100, 5100:5200]
+    print(f"Read data shape {data.shape} in {time.time() - t0:.2f} seconds")
+    reader.close()
+
+
+if __name__ == "__main__":
+    main()

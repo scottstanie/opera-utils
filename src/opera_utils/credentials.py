@@ -180,6 +180,7 @@ def print_export(dataset: str = "opera") -> None:
 
 if __name__ == "__main__":
     import logging
+    import sys
 
     logging.basicConfig()
-    print_export()
+    print_export(sys.argv[1])
