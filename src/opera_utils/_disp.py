@@ -564,8 +564,11 @@ def worker_process(
                     h5_file = get_remote_h5(
                         url, page_size=page_size, aws_credentials=aws_credentials
                     )
-                data = h5_file[dset_name][spatial_key]
-                result_queue.put((job_id, data))
+                if h5_file is not None:
+                    data = h5_file[dset_name][spatial_key]
+                    result_queue.put((job_id, data))
+                else:
+                    continue
             except Exception as e:
                 print(
                     f"Worker {worker_id} error on file {url}: {str(e)}", file=sys.stderr
