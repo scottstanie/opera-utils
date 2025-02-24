@@ -2,7 +2,7 @@ import argparse
 import time
 
 from opera_utils._disp import DispReaderPool
-from opera_utils.credentials import AWSCredentials
+from opera_utils.credentials import get_earthaccess_s3_creds
 
 
 def main():
@@ -34,9 +34,7 @@ def main():
 
     print(f"Found {len(urls)} URLs to process")
 
-    # Create AWS credentials
-
-    aws_credentials = AWSCredentials()
+    aws_credentials = get_earthaccess_s3_creds("opera-uat")
 
     # Create and use the reader
     t0 = time.time()
