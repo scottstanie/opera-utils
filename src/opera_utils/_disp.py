@@ -697,6 +697,7 @@ class DispReaderPool:
             spatial_key = (slice(None), slice(None))
 
         # Submit tasks to worker processes
+        # TODO: the `time_key` should just filter out some of these filepaths
         for i, url in enumerate(self.filepaths):
             self.task_queue.put((i, str(url), self.dset_name, spatial_key))
 
@@ -710,14 +711,10 @@ class DispReaderPool:
 
         # Stack the results
         data = np.stack(results)
+        cur_shape = data.shape
 
         # Transform from relative to absolute displacements
-        transformed = self.incidence_pinv @ data
-
-        # Return the requested time slice
-        if isinstance(time_key, slice):
-            return transformed[time_key]
-        return transformed[time_key]
+        return (self.incidence_pinv @ data.reshape(cur_shape[0], -1)).reshape(cur_shape)
 
     def close(self):
         """Close all worker processes and clean up resources."""

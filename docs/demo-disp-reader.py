@@ -15,6 +15,13 @@ def main():
         help="File containing S3 URLs to OPERA DISP-S1 files, one per line",
     )
     parser.add_argument(
+        "--row-col",
+        type=int,
+        nargs=2,
+        required=True,
+        help="(row, column) within the frame to read from.",
+    )
+    parser.add_argument(
         "--max-concurrent",
         type=int,
         default=8,
@@ -51,16 +58,10 @@ def main():
     print(f".open() run in {time.time() - t0:.2f} seconds")
     # Example: Read slices of data
     t0 = time.time()
-    data = reader[:, 100:200, 100:200]
+    row, col = args.row_col
+    data = reader[:, row : row + 1, col : col + 1]
     print(f"Read data shape {data.shape} in {time.time() - t0:.2f} seconds")
 
-    t0 = time.time()
-    data = reader[:, 1000:1100, 1100:1200]
-    print(f"Read data shape {data.shape} in {time.time() - t0:.2f} seconds")
-
-    t0 = time.time()
-    data = reader[:, 5000:5100, 5100:5200]
-    print(f"Read data shape {data.shape} in {time.time() - t0:.2f} seconds")
     reader.close()
 
 
