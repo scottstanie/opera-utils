@@ -545,6 +545,7 @@ def worker_process(
     """
     print(f"Worker {worker_id} started", file=sys.stderr)
 
+    h5_file = None
     while True:
         try:
             # Get a task from the queue
@@ -558,12 +559,12 @@ def worker_process(
             job_id, url, dset_name, spatial_key = task
 
             try:
-                # Open the H5 file, read data, and close immediately
-                h5_file = get_remote_h5(
-                    url, page_size=page_size, aws_credentials=aws_credentials
-                )
+                if h5_file is None:
+                    # Open the H5 file, read data, and close immediately
+                    h5_file = get_remote_h5(
+                        url, page_size=page_size, aws_credentials=aws_credentials
+                    )
                 data = h5_file[dset_name][spatial_key]
-                h5_file.close()
                 result_queue.put((job_id, data))
             except Exception as e:
                 print(
@@ -575,6 +576,8 @@ def worker_process(
             print(f"Worker {worker_id} unexpected error: {str(e)}", file=sys.stderr)
             # In case of unexpected error, continue running
             continue
+        if h5_file is not None:
+            h5_file.close()
 
 
 class DispReaderPool:
