@@ -462,9 +462,9 @@ def main(
     dates = reader.unique_dates[1:]
 
     time_series = read_time_series(reader, locations)
-    for loc in locations:
+    for loc, ts in zip(locations, time_series):
         # Add time series to the location data
-        loc["time_series"] = time_series
+        loc["time_series"] = ts
 
     df_wide = create_dataframes(locations, dates)
     save_outputs(df_wide, locations, dates, output_dir, plot)

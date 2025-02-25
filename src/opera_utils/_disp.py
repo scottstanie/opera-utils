@@ -385,6 +385,7 @@ class DispReader:
     aws_credentials: Optional[Any] = None
     use_multiprocessing: bool = False
     max_workers: int = 4
+    zero_nans: bool = True
 
     def __post_init__(self):
         # Sort filepaths by secondary datetime
@@ -616,6 +617,8 @@ class DispReader:
             data = np.stack(data)
 
         # Transform from relative to absolute displacements
+        if self.zero_nans:
+            np.nan_to_num(data, copy=False)
         cur_shape = data.shape
         return (self.incidence_pinv @ data.reshape(cur_shape[0], -1)).reshape(cur_shape)
 
