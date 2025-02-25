@@ -286,8 +286,8 @@ class GeoTransform(NamedTuple):
     pixel_width: float
     rotation_x: float
     top_left_y: float
-    pixel_height: float
     rotation_y: float
+    pixel_height: float
 
 
 @dataclass
@@ -299,7 +299,7 @@ class FrameMetadata:
     @property
     def resolution(self) -> tuple[float, float]:
         """Resolution of the geospatial data."""
-        return (self.geotransform.pixel_width, self.geotransform.pixel_height)
+        return (abs(self.geotransform.pixel_width), abs(self.geotransform.pixel_height))
 
     @classmethod
     def from_frame_id(cls, frame_id: int) -> "FrameMetadata":
