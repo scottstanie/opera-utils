@@ -92,7 +92,7 @@ def main():
     transform = Affine.from_gdal(*frame_metadata.geotransform)
     rowcol_to_utm = AffineTransformer(transform)
     utm_to_lonlat = pyproj.Transformer.from_crs(
-        frame_metadata.epsg, "EPSG:4326", always_xy=True
+        frame_metadata.crs.to_epsg(), "EPSG:4326", always_xy=True
     )
 
     t0 = time.time()
