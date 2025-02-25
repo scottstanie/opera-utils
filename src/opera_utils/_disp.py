@@ -673,7 +673,10 @@ class DispReader:
         else:
             # Close all open datasets
             for ds in self.datasets:
-                ds.close()
+                try:
+                    ds.close()
+                except AttributeError:
+                    ds = None
             self.datasets = []
 
         self._opened = False
