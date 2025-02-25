@@ -92,7 +92,7 @@ def get_frame_transformers(
     Returns
     -------
     tuple[AffineTransformer, pyproj.Transformer, int]
-        tuple of (rowcol_to_utm, utm_to_lonlat, frame_id)
+        tuple of (frame_affine_transformer, utm_to_lonlat, frame_id)
 
     Raises
     ------
@@ -111,21 +111,21 @@ def get_frame_transformers(
 
     # Set up the transformer from row/col to UTM and lat/lon
     transform = Affine.from_gdal(*frame_metadata.geotransform)
-    rowcol_to_utm = AffineTransformer(transform)
+    frame_affine_transformer = AffineTransformer(transform)
 
     # Create transformer between UTM and lat/lon (WGS84)
     utm_to_lonlat = pyproj.Transformer.from_crs(
         frame_metadata.crs.to_epsg(), "EPSG:4326", always_xy=True
     )
 
-    return rowcol_to_utm, utm_to_lonlat, frame_id
+    return frame_affine_transformer, utm_to_lonlat, frame_id
 
 
 def lonlat_to_rowcol(
     lons: Sequence[float],
     lats: Sequence[float],
     utm_to_lonlat: pyproj.Transformer,
-    rowcol_to_utm: AffineTransformer,
+    frame_affine_transformer: AffineTransformer,
 ) -> list[tuple[int, int]]:
     """Convert lon/lat coordinates to row/col indices.
 
@@ -137,7 +137,7 @@ def lonlat_to_rowcol(
         list of latitude values
     utm_to_lonlat : pyproj.Transformer
         Transformer for UTM to lon/lat conversion
-    rowcol_to_utm : AffineTransformer
+    frame_affine_transformer : AffineTransformer
         Transformer for row/col to UTM conversion
 
     Returns
@@ -145,18 +145,14 @@ def lonlat_to_rowcol(
     list[tuple[int, int]]
         list of (row, col) tuples
     """
-    # Create the inverse transformers
-    lonlat_to_utm = utm_to_lonlat.inverse()
-    utm_to_rowcol = ~rowcol_to_utm
-
     # Convert each lat/lon pair to row/col
     result = []
     for lon, lat in zip(lons, lats):
         # Convert lat/lon to UTM coordinates
-        utm_x, utm_y = lonlat_to_utm.transform(lon, lat)
+        utm_x, utm_y = utm_to_lonlat.transform(lon, lat, direction="INVERSE")
 
         # Convert UTM to row/col
-        row, col = utm_to_rowcol.rowcol(utm_x, utm_y)
+        row, col = frame_affine_transformer.rowcol(utm_x, utm_y)
 
         # Convert to integers and add to result
         result.append((int(round(row)), int(round(col))))
@@ -168,7 +164,7 @@ def get_sample_locations(
     row_col: Optional[tuple[int, int]],
     lats: Optional[Sequence[float]],
     lons: Optional[Sequence[float]],
-    rowcol_to_utm: Affine,
+    frame_affine_transformer: Affine,
     utm_to_lonlat: pyproj.Transformer,
 ) -> list[dict[str, Any]]:
     """Get sample locations based on input arguments.
@@ -181,7 +177,7 @@ def get_sample_locations(
         list of latitudes.
     lons : Optional[Sequence[float]], optional
         list of longitudes.
-    rowcol_to_utm : Affine
+    frame_affine_transformer : Affine
         Transformer for row/col to UTM conversion.
     utm_to_lonlat : pyproj.Transformer
         Transformer for UTM to lon/lat conversion.
@@ -209,13 +205,15 @@ def get_sample_locations(
                 f"Number of latitudes ({len(lats)}) must match number of longitudes ({len(lons)})"
             )
         # Convert lat/lon to row/col
-        base_locations = lonlat_to_rowcol(lons, lats, utm_to_lonlat, rowcol_to_utm)
+        base_locations = lonlat_to_rowcol(
+            lons, lats, utm_to_lonlat, frame_affine_transformer
+        )
     else:
         raise ValueError("Either row_col or both lats and lons must be provided")
 
     # Process each location
     for i, (row, col) in enumerate(base_locations):
-        utm_x, utm_y = rowcol_to_utm.xy(row, col)
+        utm_x, utm_y = frame_affine_transformer.xy(row, col)
         lon, lat = utm_to_lonlat.transform(utm_x, utm_y)
         locations.append(
             {
@@ -447,14 +445,14 @@ def main(
         urls, page_size=page_size, max_workers=max_workers, dset_name=dset_name
     )
 
-    rowcol_to_utm, utm_to_lonlat, frame_id = get_frame_transformers(reader)
+    frame_affine_transformer, utm_to_lonlat, frame_id = get_frame_transformers(reader)
     print(f"Procssing OPERA DISP Frame {frame_id:05d}")
 
     locations = get_sample_locations(
         row_col=row_col,
         lats=lats,
         lons=lons,
-        rowcol_to_utm=rowcol_to_utm,
+        frame_affine_transformer=frame_affine_transformer,
         utm_to_lonlat=utm_to_lonlat,
     )
 
