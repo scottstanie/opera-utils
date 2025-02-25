@@ -10,11 +10,10 @@ from typing import Literal, TypeVar
 import h5netcdf
 import h5py
 import numpy as np
-from pyproj import Transformer
+import pyproj
 from tqdm.auto import tqdm
 
 from ._dates import get_dates
-from ._types import Bbox
 from ._utils import flatten
 from .burst_frame_db import get_frame_bbox
 from .constants import DISP_FILE_REGEX
@@ -295,52 +294,68 @@ def get_incidence_matrix(
     return A
 
 
-def get_geospatial_metadata(frame_id: int) -> dict:
-    """
-    Get the geospatial metadata for a given frame.
+from typing import NamedTuple
 
-    This function retrieves the bounding box and EPSG code for the specified frame
-    using `get_frame_bbox`, then constructs a geotransform based on known properties:
-    - The image is always in UTM.
-    - Pixel spacing is fixed at 30 m by 30 m.
-    - The geotransform is defined as (top left x, pixel width, rotation_x, top left y, rotation_y, pixel height),
-      where the top left coordinate is (xmin, ymax) because y typically decreases downward in raster data.
 
-    Additionally, the full CRS object is constructed using pyproj.
+class GeoTransform(NamedTuple):
+    """Named tuple for a GDAL Geotransform tuple.
 
-    Parameters
+    References
     ----------
-    frame_id : int
-        The ID of the frame to get metadata for.
-
-    Returns
-    -------
-    dict
-        A dictionary containing:
-          - "crs": pyproj CRS object based on the EPSG code.
-          - "bbox": tuple of (xmin, ymin, xmax, ymax).
-          - "geotransform": tuple (top left x, pixel width, 0, top left y, 0, pixel height)
-            where pixel height is negative for a top-down image orientation.
-          - "resolution": (30, 30)
+    https://gdal.org/en/stable/tutorials/geotransforms_tut.html
     """
-    import pyproj
 
-    # Retrieve the EPSG and bounding box, e.g. (xmin, ymin, xmax, ymax)
-    epsg, bbox = get_frame_bbox(frame_id)
-    crs = pyproj.CRS.from_epsg(epsg)
+    top_left_x: float
+    pixel_width: float
+    rotation_x: float
+    top_left_y: float
+    pixel_height: float
+    rotation_y: float
 
-    xmin, ymin, xmax, ymax = bbox
-    # Construct the geotransform.
-    # Top left coordinate: (xmin, ymax)
-    # Pixel width: 30, and pixel height is -30 (negative because it goes downward)
-    geotransform = (xmin, 30, 0, ymax, 0, -30)
 
-    return {
-        "crs": crs,
-        "bbox": bbox,
-        "geotransform": geotransform,
-        "resolution": (30, 30),
-    }
+@dataclass
+class FrameMetadata:
+    crs: pyproj.CRS
+    bbox: tuple[float, float, float, float]
+    geotransform: GeoTransform
+
+    @property
+    def resolution(self) -> tuple[float, float]:
+        """Resolution of the geospatial data."""
+        return (self.geotransform.pixel_width, self.geotransform.pixel_height)
+
+    @classmethod
+    def from_frame_id(cls, frame_id: int) -> "FrameMetadata":
+        """
+        Get the geospatial metadata for a given frame.
+
+        This function retrieves the bounding box and EPSG code for the specified frame
+        using `get_frame_bbox`, then constructs a geotransform based on known properties:
+        - The image is always in UTM.
+        - Pixel spacing is fixed at 30 m by 30 m.
+        - The geotransform is defined as (top left x, pixel width, rotation_x, top left y, rotation_y, pixel height),
+        where the top left coordinate is (xmin, ymax) because y typically decreases downward in raster data.
+
+        Additionally, the full CRS object is constructed using pyproj.
+
+        Parameters
+        ----------
+        frame_id : int
+            The ID of the frame to get metadata for.
+
+        Returns
+        -------
+        FrameMetadata
+            Dataclass containing Frame's geospatial metadata
+        """
+        # Retrieve the EPSG and bounding box, e.g. (xmin, ymin, xmax, ymax)
+        epsg, bbox = get_frame_bbox(frame_id)
+        crs = pyproj.CRS.from_epsg(epsg)
+
+        xmin, ymin, xmax, ymax = bbox
+        return cls(
+            crs=crs, bbox=bbox, geotransform=GeoTransform(xmin, 30, 0, ymax, 0, -30)
+        )
 
 
 def utm_to_rowcol(
@@ -371,148 +386,6 @@ def utm_to_rowcol(
     col = int(round((utm_x - xmin) / pixel_width))
     row = int(round((ymax - utm_y) / abs(pixel_height)))
     return row, col
-
-
-def lonlat_to_utm(lon: float, lat: float, utm_crs) -> tuple[float, float]:
-    """
-    Convert geographic coordinates (longitude, latitude) to UTM coordinates using a target CRS.
-
-    Parameters
-    ----------
-    lon : float
-        Longitude in degrees.
-    lat : float
-        Latitude in degrees.
-    utm_crs : pyproj.CRS
-        Target UTM coordinate system (typically from get_geospatial_metadata).
-
-    Returns
-    -------
-    tuple[float, float]
-        (utm_x, utm_y) coordinates.
-    """
-    transformer = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
-    utm_x, utm_y = transformer.transform(lon, lat)
-    return utm_x, utm_y
-
-
-def lonlat_to_rowcol(
-    lon: float,
-    lat: float,
-    geotransform: tuple[float, float, float, float, float, float],
-    utm_crs,
-) -> tuple[int, int]:
-    """
-    Convert geographic coordinates (lon, lat) to pixel row and column indices.
-
-    This function transforms the (lon, lat) pair to UTM
-    and then computes the corresponding pixel indices using the provided geotransform.
-
-    Parameters
-    ----------
-    lon : float
-        Longitude in degrees.
-    lat : float
-        Latitude in degrees.
-    geotransform : tuple
-        Geotransform tuple (xmin, pixel_width, 0, ymax, 0, pixel_height).
-    utm_crs : pyproj.CRS
-        Target UTM coordinate system.
-
-    Returns
-    -------
-    tuple[int, int]
-        (row, col) indices.
-    """
-    utm_x, utm_y = lonlat_to_utm(lon, lat, utm_crs)
-    return utm_to_rowcol(utm_x, utm_y, geotransform)
-
-
-def bbox_lonlat_to_utm(bbox: Bbox, utm_crs) -> Bbox:
-    """
-    Convert a bounding box in geographic coordinates (lon, lat) to UTM coordinates.
-
-    The input Bbox has attributes (left, bottom, right, top) in lon/lat.
-    The function transforms all four corners and then determines the
-    new bounding box in UTM.
-
-    Parameters
-    ----------
-    bbox : Bbox
-        Bounding box in lon/lat.
-    utm_crs : pyproj.CRS
-        Target UTM coordinate system.
-
-    Returns
-    -------
-    Bbox
-        Bounding box in UTM coordinates.
-    """
-    transformer = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
-    # Transform each corner: lower-left, upper-left, lower-right, upper-right
-    ll = transformer.transform(bbox.left, bbox.bottom)
-    lt = transformer.transform(bbox.left, bbox.top)
-    rl = transformer.transform(bbox.right, bbox.bottom)
-    rt = transformer.transform(bbox.right, bbox.top)
-    xs = [ll[0], lt[0], rl[0], rt[0]]
-    ys = [ll[1], lt[1], rl[1], rt[1]]
-    return Bbox(left=min(xs), bottom=min(ys), right=max(xs), top=max(ys))
-
-
-def bbox_utm_to_rowcol(
-    bbox: Bbox, geotransform: tuple[float, float, float, float, float, float]
-) -> tuple[int, int, int, int]:
-    """
-    Convert a bounding box in UTM coordinates to pixel row/column indices.
-
-    The provided geotransform should be of the form
-        (xmin, pixel_width, 0, ymax, 0, pixel_height)
-    with pixel_height negative for top-down orientation.
-
-    Parameters
-    ----------
-    bbox : Bbox
-        Bounding box in UTM coordinates (left, bottom, right, top).
-    geotransform : tuple
-        Geotransform tuple as described above.
-
-    Returns
-    -------
-    tuple[int, int, int, int]
-        Pixel indices as (row_min, row_max, col_min, col_max).
-    """
-    # Use the top-left corner for the minimum indices...
-    row_min, col_min = utm_to_rowcol(bbox.left, bbox.top, geotransform)
-    # ...and the bottom-right for the maximum indices.
-    row_max, col_max = utm_to_rowcol(bbox.right, bbox.bottom, geotransform)
-    return row_min, row_max, col_min, col_max
-
-
-def bbox_lonlat_to_rowcol(
-    bbox: Bbox, geotransform: tuple[float, float, float, float, float, float], utm_crs
-) -> tuple[int, int, int, int]:
-    """
-    Convert a bounding box in geographic coordinates (lon, lat) to pixel row and column indices.
-
-    This function transforms the Bbox from lon/lat to UTM using the provided target CRS,
-    then computes the pixel indices using the geotransform.
-
-    Parameters
-    ----------
-    bbox : Bbox
-        Bounding box in lon/lat (left, bottom, right, top).
-    geotransform : tuple
-        Geotransform tuple (xmin, pixel_width, 0, ymax, 0, pixel_height).
-    utm_crs : pyproj.CRS
-        Target UTM coordinate system.
-
-    Returns
-    -------
-    tuple[int, int, int, int]
-        (row_min, row_max, col_min, col_max) pixel indices.
-    """
-    utm_bbox = bbox_lonlat_to_utm(bbox, utm_crs)
-    return bbox_utm_to_rowcol(utm_bbox, geotransform)
 
 
 import multiprocessing as mp
