@@ -371,6 +371,7 @@ class DispReader:
             self.filepaths,
             key=lambda key: OperaDispFile.from_filename(key).secondary_datetime,
         )
+        self.disp_files = [OperaDispFile.from_filename(fp) for fp in self.filepaths]
         self._is_s3 = "s3://" in str(self.filepaths[0])
         self._is_http = "http:" in str(self.filepaths[0])
 
