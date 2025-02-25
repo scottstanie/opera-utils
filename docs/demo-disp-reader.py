@@ -161,7 +161,8 @@ def lonlat_to_rowcol(
 
 
 def get_sample_locations(
-    row_col: Optional[tuple[int, int]],
+    rows: Optional[Sequence[int]],
+    cols: Optional[Sequence[int]],
     lats: Optional[Sequence[float]],
     lons: Optional[Sequence[float]],
     frame_affine_transformer: Affine,
@@ -171,8 +172,10 @@ def get_sample_locations(
 
     Parameters
     ----------
-    row_col : Optional[tuple[int, int]], optional
-        Single (row, column) location.
+    rows : Optional[Sequence[int]], optional
+        Row indexes (alternative to lat/lon)
+    cols : Optional[Sequence[int]], optional
+        Column indexes (alternative to lat/lon)
     lats : Optional[Sequence[float]], optional
         list of latitudes.
     lons : Optional[Sequence[float]], optional
@@ -190,14 +193,14 @@ def get_sample_locations(
     Raises
     ------
     ValueError
-        If neither row_col nor lats/lons are provided,
+        If neither rows,cols nor lats/lons are provided,
         or if lats and lons have different lengths.
     """
     locations = []
 
     # Determine the base locations from arguments
-    if row_col is not None:
-        base_locations = [row_col]
+    if rows is not None and cols is not None:
+        base_locations = list(zip(rows, cols, strict=True))
     elif lats is not None and lons is not None:
         # Validate lat/lon inputs
         if len(lats) != len(lons):
@@ -209,7 +212,7 @@ def get_sample_locations(
             lons, lats, utm_to_lonlat, frame_affine_transformer
         )
     else:
-        raise ValueError("Either row_col or both lats and lons must be provided")
+        raise ValueError("Either --rows, --cols or --lats and --lons must be provided")
 
     # Process each location
     for i, (row, col) in enumerate(base_locations):
@@ -404,7 +407,8 @@ def save_outputs(
 
 def main(
     url_file: str,
-    row_col: Optional[tuple[int, int]] = None,
+    rows: Optional[Sequence[int]] = None,
+    cols: Optional[Sequence[int]] = None,
     lats: Optional[list[float]] = None,
     lons: Optional[list[float]] = None,
     dset_name: _disp.DispLayers = _disp.DispLayers.displacement,
@@ -419,8 +423,10 @@ def main(
     ----------
     url_file : str
         File containing S3 URLs to OPERA DISP-S1 files, one per line
-    row_col : Optional[tuple[int, int]], optional
-        Read one (row, column) within the frame.
+    rows : Optional[Sequence[int]], optional
+        Row indexes within the frame.
+    cols : Optional[Sequence[int]], optional
+        Column indexes within the frame.
     lats : Optional[list[float]], optional
         list of latitudes to read from (used with `lons`).
     lons : Optional[list[float]], optional
@@ -449,7 +455,8 @@ def main(
     print(f"Procssing OPERA DISP Frame {frame_id:05d}")
 
     locations = get_sample_locations(
-        row_col=row_col,
+        rows=rows,
+        cols=cols,
         lats=lats,
         lons=lons,
         frame_affine_transformer=frame_affine_transformer,
