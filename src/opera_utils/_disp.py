@@ -395,7 +395,7 @@ class DispReader:
         )
         self.disp_files = [OperaDispFile.from_filename(fp) for fp in self.filepaths]
         self._is_s3 = "s3://" in str(self.filepaths[0])
-        self._is_http = "http:" in str(self.filepaths[0])
+        self._is_http = "https" in str(self.filepaths[0])
 
         # Parse the reference/secondary times from each file
         self.ref_times, self.sec_times, _ = parse_disp_datetimes(self.filepaths)
@@ -483,7 +483,8 @@ class DispReader:
                 from osgeo import gdal
 
                 for f in tqdm(self.filepaths, desc="Opening files"):
-                    ds = gdal.Open(str(f))
+                    gdal_str = f'HDF5:"/vsicurl/{f}"://{self.dset_name.strip("/")}'
+                    ds = gdal.Open(gdal_str)
                     self.datasets.append(ds)
             else:
                 # Local files
@@ -613,7 +614,14 @@ class DispReader:
             # Read the data from each file directly
             data = []
             for ds in tqdm(self.datasets, desc="Reading data"):
-                data.append(ds[self.dset_name.value][spatial_key])
+                if self._is_s3:
+                    data.append(ds[self.dset_name.value][spatial_key])
+                else:
+                    # TODO: Need to store the image size to cut off edges same as slice
+                    xoff, yoff, xsize, ysize = _slice_to_offsets(
+                        *spatial_key,
+                    )
+                    data.append(ds.ReadAsArray(xoff, yoff, xsize, ysize))
             data = np.stack(data)
 
         # Transform from relative to absolute displacements
@@ -652,3 +660,13 @@ class DispReader:
     def __del__(self):
         """Ensure resources are cleaned up when the object is garbage collected."""
         self.close()
+
+
+def _slice_to_offsets(rows: slice, cols: slice) -> tuple[int, int, int, int]:
+    xoff, yoff = int(cols.start), int(rows.start)
+    # row_stop = min(rows.stop, nrows)
+    # col_stop = min(cols.stop, ncols)
+    row_stop = rows.stop
+    col_stop = cols.stop
+    xsize, ysize = int(col_stop - cols.start), int(row_stop - rows.start)
+    return xoff, yoff, xsize, ysize
