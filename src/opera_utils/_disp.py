@@ -2,28 +2,28 @@ from __future__ import annotations
 
 import logging
 import multiprocessing as mp
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from itertools import chain
 from pathlib import Path
-from typing import Literal, NamedTuple, TypeVar
+from typing import Any, Literal, NamedTuple, Optional, TypeVar, Union
 
-import h5netcdf
 import h5py
 import numpy as np
 import pyproj
 from tqdm.auto import tqdm
 
-from ._dates import get_dates
-from ._utils import flatten
-from .burst_frame_db import get_frame_bbox
-from .constants import DISP_FILE_REGEX
-from .credentials import AWSCredentials
-
 T = TypeVar("T")
+PathOrStr = Union[str, Path]
+
 __all__ = [
     "OperaDispFile",
     "parse_disp_datetimes",
+    "DispReader",
+    "GeoTransform",
+    "FrameMetadata",
+    "utm_to_rowcol",
 ]
 
 logger = logging.getLogger("opera_utils")
@@ -43,8 +43,26 @@ class OperaDispFile:
     generation_datetime: datetime
 
     @classmethod
-    def from_filename(cls, name: Path | str) -> "OperaDispFile":
-        """Create a OperaDispFile from a filename."""
+    def from_filename(cls, name: PathOrStr) -> "OperaDispFile":
+        """Create a OperaDispFile from a filename.
+
+        Parameters
+        ----------
+        name : str or Path
+            Filename to parse for OPERA DISP-S1 information.
+
+        Returns
+        -------
+        OperaDispFile
+            Parsed file information.
+
+        Raises
+        ------
+        ValueError
+            If the filename format is invalid.
+        """
+        from .constants import DISP_FILE_REGEX
+
         if not (match := DISP_FILE_REGEX.match(Path(name).name)):
             raise ValueError(f"Invalid filename format: {name}")
 
@@ -60,24 +78,55 @@ class OperaDispFile:
 
 
 def parse_disp_datetimes(
-    opera_disp_file_list: Sequence[Path | str],
-) -> tuple[tuple[datetime], tuple[datetime], tuple[datetime]]:
-    """Parse the datetimes from a list of OPERA DISP-S1 filenames."""
+    opera_disp_file_list: Sequence[PathOrStr],
+) -> tuple[tuple[datetime, ...], tuple[datetime, ...], tuple[datetime, ...]]:
+    """Parse the datetimes from a list of OPERA DISP-S1 filenames.
+
+    Parameters
+    ----------
+    opera_disp_file_list : Sequence[str or Path]
+        List of OPERA DISP-S1 filenames to parse.
+
+    Returns
+    -------
+    tuple[tuple[datetime, ...], tuple[datetime, ...], tuple[datetime, ...]]
+        Tuple of (reference_times, secondary_times, generation_times).
+    """
+    from ._dates import get_dates
+
     dts = [get_dates(f, fmt="%Y%m%dT%H%M%SZ") for f in opera_disp_file_list]
 
-    reference_times: tuple[datetime]
-    secondary_times: tuple[datetime]
-    generation_times: tuple[datetime]
-    reference_times, secondary_times, generation_times = zip(*dts)
+    reference_times = tuple(dt[0] for dt in dts)
+    secondary_times = tuple(dt[1] for dt in dts)
+    generation_times = tuple(dt[2] for dt in dts)
+
     return reference_times, secondary_times, generation_times
 
 
 def get_remote_h5(
     url: str,
-    aws_credentials: AWSCredentials | None = None,
+    aws_credentials=None,
     page_size: int = 4 * 1024 * 1024,
-    rdcc_nbytes=1024 * 1024 * 100,
-) -> h5netcdf.File:
+    rdcc_nbytes: int = 1024 * 1024 * 100,
+) -> h5py.File:
+    """Open a remote HDF5 file using the ROS3 driver.
+
+    Parameters
+    ----------
+    url : str
+        S3 URL to the HDF5 file.
+    aws_credentials : AWSCredentials, optional
+        AWS credentials for accessing S3.
+    page_size : int, optional
+        File system page size in bytes. Default is 4 MB.
+    rdcc_nbytes : int, optional
+        Raw data chunk cache size in bytes. Default is 100 MB.
+
+    Returns
+    -------
+    h5py.File
+        Opened HDF5 file.
+    """
     from .credentials import get_frozen_credentials
 
     secret_id, secret_key, session_token = get_frozen_credentials(
@@ -93,7 +142,7 @@ def get_remote_h5(
 
     # Set page size for cloud-optimized HDF5
     cloud_kwargs = dict(fs_page_size=page_size, rdcc_nbytes=rdcc_nbytes)
-    # return h5netcdf.File(
+
     return h5py.File(
         url,
         "r",
@@ -103,157 +152,44 @@ def get_remote_h5(
     )
 
 
-class DispReader:
-    """A reader for a stack of OPERA DISP-S1 files.
-
-    When reading a stack of data along the time dimension, the data are assumed to be stored
-    as relative displacements. We convert these to displacement from the first epoch by
-    multiplying along the time axis by the pseudo-inverse of the incidence matrix.
-
-    Parameters
-    ----------
-    filepaths : list[str | Path]
-        list of paths to OPERA DISP-S1 files to read.
-    page_size : int, optional
-        Page size in bytes for HDF5 file system page strategy. Default is 4 MB.
-    """
-
-    def __init__(
-        self,
-        filepaths: list[str | Path],
-        page_size: int = 4 * 1024 * 1024,
-        # TODO: refactor, get full list
-        dset_name: Literal[
-            "displacement", "short_wavelength_displacement"
-        ] = "displacement",
-        aws_credentials=None,
-        max_concurrent: int = 50,
-    ):
-        # self.filepaths = [Path(f) for f in filepaths]
-        self.filepaths = sorted(
-            filepaths,
-            key=lambda key: OperaDispFile.from_filename(key).secondary_datetime,
-        )
-        self._is_s3 = "s3://" in filepaths[0]
-        # TODO: provide the formatting like
-        # 'HDF5:"/vsicurl/https://datapool...OPERA_...240Z.nc"://displacement'
-        self._is_http = "http:" in filepaths[0]
-
-        self.page_size = page_size
-        self.dset_name = dset_name
-        self.max_concurrent = max_concurrent
-
-        # Parse the reference/secondary times from each file
-        self.ref_times, self.sec_times, _ = parse_disp_datetimes(self.filepaths)
-        # Get the unique dates in chronological order
-        self.unique_dates = sorted(set(self.ref_times + self.sec_times))
-
-        # Create the incidence matrix for the full stack
-        # Each row represents one file, with -1 at ref_time and +1 at sec_time
-        ifg_pairs = list(zip(self.ref_times, self.sec_times))
-        self.incidence_matrix = get_incidence_matrix(
-            ifg_pairs, sar_idxs=self.unique_dates, delete_first_date_column=True
-        )
-        self.incidence_pinv = np.linalg.pinv(self.incidence_matrix)
-
-        self.aws_credentials = aws_credentials
-        self._opened = False
-        self.datasets = []
-
-    def open(self, aws_credentials=None):
-        # Open all files with h5netcdf
-        if self._is_s3:
-            creds = aws_credentials or self.aws_credentials
-            for f in tqdm(self.filepaths):
-                ds = get_remote_h5(
-                    str(f), page_size=self.page_size, aws_credentials=creds
-                )
-                self.datasets.append(ds)
-        elif self._is_http:
-            from osgeo import gdal
-
-            for f in tqdm(self.filepaths):
-                ds = gdal.Open(f)
-                self.datasets.append(ds)
-
-        self._opened = True
-
-    def __getitem__(self, key):
-        """Get a slice of data from the stack.
-
-        Parameters
-        ----------
-        key : tuple[slice | int]
-            Tuple of slices/indices into (time, y, x) dimensions.
-
-        Returns
-        -------
-        np.ndarray
-            Data transformed from relative to absolute displacements.
-        """
-        if not self._opened:
-            logging.debug("Not opened yet, running...")
-            self.open()
-
-        # Get the time slice/index
-        if isinstance(key, tuple):
-            time_key = key[0]
-            spatial_key = key[1:]
-        else:
-            time_key = key
-            spatial_key = (slice(None), slice(None))
-
-        # Read the data from each file
-        data = []
-        for ds in self.datasets:
-            data.append(ds[self.dset_name][spatial_key])
-        data = np.stack(data)
-
-        cur_shape = data.shape
-        return (self.incidence_pinv @ data.reshape(cur_shape[0], -1)).reshape(cur_shape)
-
-    def close(self):
-        """Close all open datasets."""
-        for ds in self.datasets:
-            ds.close()
-        self._opened = False
-
-    def __del__(self):
-        self.close()
-
-
 def get_incidence_matrix(
     ifg_pairs: Sequence[tuple[T, T]],
-    sar_idxs: Sequence[T] | None = None,
+    sar_idxs: Optional[Sequence[T]] = None,
     delete_first_date_column: bool = True,
 ) -> np.ndarray:
-    """Build the indicator matrix from a list of ifg pairs (index 1, index 2).
+    """Build the indicator matrix from a list of interferogram pairs.
 
     Parameters
     ----------
     ifg_pairs : Sequence[tuple[T, T]]
-        list of ifg pairs represented as tuples of (day 1, day 2)
+        List of interferogram pairs represented as tuples of (day 1, day 2).
         Can be ints, datetimes, etc.
     sar_idxs : Sequence[T], optional
         If provided, used as the total set of indexes which `ifg_pairs`
         were formed from.
         Otherwise, created from the unique entries in `ifg_pairs`.
         Only provide if there are some dates which are not present in `ifg_pairs`.
-    delete_first_date_column : bool
+    delete_first_date_column : bool, optional
         If True, removes the first column of the matrix to make it full column rank.
         Size will be `n_sar_dates - 1` columns.
         Otherwise, the matrix will have `n_sar_dates`, but rank `n_sar_dates - 1`.
+        Default is True.
 
     Returns
     -------
-    A : np.array 2D
+    np.ndarray
         The incident-like matrix for the system: A*phi = dphi
-        Each row corresponds to an ifg, each column to a SAR date.
+        Each row corresponds to an interferogram, each column to a SAR date.
         The value will be -1 on the early (reference) ifgs, +1 on later (secondary)
         since the ifg phase = (later - earlier)
-        Shape: (n_ifgs, n_sar_dates - 1)
-
+        Shape: (n_ifgs, n_sar_dates - 1) if delete_first_date_column=True
+               (n_ifgs, n_sar_dates) otherwise
     """
+
+    def flatten(list_of_lists: Iterable[Iterable[Any]]) -> chain[Any]:
+        """Flatten one level of a nested iterable."""
+        return chain.from_iterable(list_of_lists)
+
     if sar_idxs is None:
         sar_idxs = sorted(set(flatten(ifg_pairs)))
 
@@ -277,6 +213,21 @@ def get_incidence_matrix(
 class GeoTransform(NamedTuple):
     """Named tuple for a GDAL Geotransform tuple.
 
+    Attributes
+    ----------
+    top_left_x : float
+        X coordinate of the top-left corner.
+    pixel_width : float
+        Width of a pixel in map units.
+    rotation_x : float
+        X rotation (usually 0).
+    top_left_y : float
+        Y coordinate of the top-left corner.
+    rotation_y : float
+        Y rotation (usually 0).
+    pixel_height : float
+        Height of a pixel in map units (typically negative).
+
     References
     ----------
     https://gdal.org/en/stable/tutorials/geotransforms_tut.html
@@ -292,28 +243,44 @@ class GeoTransform(NamedTuple):
 
 @dataclass
 class FrameMetadata:
+    """Geospatial metadata for a frame.
+
+    Attributes
+    ----------
+    crs : pyproj.CRS
+        Coordinate reference system.
+    bbox : tuple[float, float, float, float]
+        Bounding box as (xmin, ymin, xmax, ymax).
+    geotransform : GeoTransform
+        GDAL-style geotransform.
+    """
+
     crs: pyproj.CRS
     bbox: tuple[float, float, float, float]
     geotransform: GeoTransform
 
     @property
     def resolution(self) -> tuple[float, float]:
-        """Resolution of the geospatial data."""
+        """Resolution of the geospatial data in (x, y) directions.
+
+        Returns
+        -------
+        tuple[float, float]
+            Resolution as (x_resolution, y_resolution) in CRS units.
+        """
         return (abs(self.geotransform.pixel_width), abs(self.geotransform.pixel_height))
 
     @classmethod
     def from_frame_id(cls, frame_id: int) -> "FrameMetadata":
-        """
-        Get the geospatial metadata for a given frame.
+        """Get the geospatial metadata for a given frame.
 
         This function retrieves the bounding box and EPSG code for the specified frame
         using `get_frame_bbox`, then constructs a geotransform based on known properties:
         - The image is always in UTM.
         - Pixel spacing is fixed at 30 m by 30 m.
-        - The geotransform is defined as (top left x, pixel width, rotation_x, top left y, rotation_y, pixel height),
-        where the top left coordinate is (xmin, ymax) because y typically decreases downward in raster data.
-
-        Additionally, the full CRS object is constructed using pyproj.
+        - The geotransform is defined as (top left x, pixel width, rotation_x,
+          top left y, rotation_y, pixel height), where the top left coordinate is
+          (xmin, ymax) because y typically decreases downward in raster data.
 
         Parameters
         ----------
@@ -323,9 +290,11 @@ class FrameMetadata:
         Returns
         -------
         FrameMetadata
-            Dataclass containing Frame's geospatial metadata
+            Dataclass containing frame's geospatial metadata.
         """
         # Retrieve the EPSG and bounding box, e.g. (xmin, ymin, xmax, ymax)
+        from .burst_frame_db import get_frame_bbox
+
         epsg, bbox = get_frame_bbox(frame_id)
         crs = pyproj.CRS.from_epsg(epsg)
 
@@ -340,8 +309,7 @@ def utm_to_rowcol(
     utm_y: float,
     geotransform: tuple[float, float, float, float, float, float],
 ) -> tuple[int, int]:
-    """
-    Convert UTM coordinates to pixel row and column indices using the provided geotransform.
+    """Convert UTM coordinates to pixel row and column indices.
 
     Parameters
     ----------
@@ -365,94 +333,50 @@ def utm_to_rowcol(
     return row, col
 
 
-def worker_main(
-    worker_id, urls_for_worker, dset_name, aws_credentials, request_queue, result_queue
-):
-    """Opens all the URLs assigned to this worker exactly once.
-    Then repeatedly waits for read requests on `request_queue`.
-    For each request, reads the slice from the appropriate open file
-    and puts the result on `result_queue`.
-    """
+@dataclass
+class DispReader:
+    """A reader for a stack of OPERA DISP-S1 files with optional multiprocessing.
 
-    # Open each file once
-    file_handles = {}
-    for url in urls_for_worker:
-        file_handles[url] = get_remote_h5(url, aws_credentials=aws_credentials)
-
-    logger.debug(f"[Worker {worker_id}] opened {len(file_handles)} files")
-
-    while True:
-        msg = request_queue.get()
-        if msg is None:
-            # Sentinel -> time to shut down
-            break
-
-        idx, url, slice_obj = msg
-
-        # Read the data
-        # (We assume 'dset_name' exists in the opened file)
-        fh = file_handles[url]
-        if fh is None:
-            # The file failed to open, send back an error
-            result_queue.put((idx, f"Error: Could not open {url}"))
-        else:
-            try:
-                arr = fh[dset_name][slice_obj]
-                # Return the array
-                result_queue.put((idx, arr))
-            except Exception as e:
-                result_queue.put((idx, f"Error reading {url}: {str(e)}"))
-
-    # Close all open handles
-    for h in file_handles.values():
-        if h is not None:
-            h.close()
-
-    logger.debug(f"[Worker {worker_id}] shutting down")
-
-
-class DispReaderPool:
-    """A reader for a stack of OPERA DISP-S1 files with multiprocessing support.
+    When reading a stack of data along the time dimension, the data are assumed to be stored
+    as relative displacements. We convert these to displacement from the first epoch by
+    multiplying along the time axis by the pseudo-inverse of the incidence matrix.
 
     Parameters
     ----------
     filepaths : list[str | Path]
-        list of paths to OPERA DISP-S1 files to read.
+        List of paths to OPERA DISP-S1 files to read.
     page_size : int, optional
         Page size in bytes for HDF5 file system page strategy. Default is 4 MB.
-    dset_name : Literal["displacement", "short_wavelength_displacement"], optional
+    dset_name : {"displacement", "short_wavelength_displacement"}, optional
         Name of the dataset to read. Default is "displacement".
-    aws_credentials : dict[str, Any], optional
-        AWS credentials for accessing S3.
-    max_concurrent : int, optional
-        Maximum number of worker processes to use. Default is 4.
+    aws_credentials : AWSCredentials, optional
+        AWS credentials for accessing S3 files.
+    use_multiprocessing : bool, optional
+        Whether to use multiprocessing for parallel reading. Default is False.
+    max_workers : int, optional
+        Maximum number of worker processes to use when multiprocessing is enabled.
+        Default is 4.
     """
 
-    def __init__(
-        self,
-        filepaths: list[str | Path],
-        page_size: int = 4 * 1024 * 1024,
-        dset_name: Literal[
-            "displacement", "short_wavelength_displacement"
-        ] = "displacement",
-        aws_credentials=None,
-        max_concurrent: int = 4,
-    ):
+    filepaths: list[PathOrStr]
+    page_size: int = 4 * 1024 * 1024
+    dset_name: Literal["displacement", "short_wavelength_displacement"] = "displacement"
+    aws_credentials: Optional[Any] = None
+    use_multiprocessing: bool = False
+    max_workers: int = 4
+
+    def __post_init__(self):
         # Sort filepaths by secondary datetime
         self.filepaths = sorted(
-            filepaths,
+            self.filepaths,
             key=lambda key: OperaDispFile.from_filename(key).secondary_datetime,
         )
-        self._is_s3 = "s3://" in str(filepaths[0])
-        self._is_http = "http:" in str(filepaths[0])
-
-        self.page_size = page_size
-        self.dset_name = dset_name
-        self.max_concurrent = max_concurrent
-        self.aws_credentials = aws_credentials
+        self._is_s3 = "s3://" in str(self.filepaths[0])
+        self._is_http = "http:" in str(self.filepaths[0])
 
         # Parse the reference/secondary times from each file
         self.ref_times, self.sec_times, _ = parse_disp_datetimes(self.filepaths)
+
         # Get the unique dates in chronological order
         self.unique_dates = sorted(set(self.ref_times + self.sec_times))
 
@@ -463,70 +387,161 @@ class DispReaderPool:
         )
         self.incidence_pinv = np.linalg.pinv(self.incidence_matrix)
 
-        # 1) Partition the filepaths across workers
-        # E.g. round-robin or hash or chunk them
-        # Simple round-robin approach:
-        self.worker_file_lists = [[] for _ in range(max_concurrent)]
-        for i, url in enumerate(self.filepaths):
-            w_id = i % max_concurrent
-            self.worker_file_lists[w_id].append(url)
+        # Multiprocessing setup if enabled
+        if self.use_multiprocessing:
+            # Partition the filepaths across workers
+            self.worker_file_lists = [[] for _ in range(self.max_workers)]
+            for i, url in enumerate(self.filepaths):
+                w_id = i % self.max_workers
+                self.worker_file_lists[w_id].append(str(url))
 
-        # 2) Make a lookup: which worker ID is responsible for each URL?
-        self.url_to_worker = {}
-        for w_id, url_list in enumerate(self.worker_file_lists):
-            for url in url_list:
-                self.url_to_worker[url] = w_id
+            # Make a lookup: which worker ID is responsible for each URL?
+            self.url_to_worker = {}
+            for w_id, url_list in enumerate(self.worker_file_lists):
+                for url in url_list:
+                    self.url_to_worker[url] = w_id
 
-        # Initialize multiprocessing resources
-        # self.task_queue = mp.Queue()
-        self.task_queues: list[mp.Queue] = []
-        self.result_queue = mp.Queue()
-        self.workers = []
+            # Initialize multiprocessing resources
+            self.task_queues = [mp.Queue() for _ in range(self.max_workers)]
+            self.result_queue = mp.Queue()
+            self.workers = []
+        else:
+            # For non-multiprocessing mode
+            self.datasets = []
+
         self._opened = False
 
-    def open(self, aws_credentials=None):
-        """Start worker processes for parallel reading.
+    def open(self, aws_credentials: Optional[Any] = None) -> None:
+        """Open the datasets for reading.
 
         Parameters
         ----------
-        aws_credentials : dict[str, Any], optional
+        aws_credentials : AWSCredentials, optional
             AWS credentials for accessing S3. If not provided, uses the credentials
             specified during initialization.
         """
         if self._opened:
             return
 
-        # Make sure credentials are set
-        self.aws_credentials = aws_credentials or self.aws_credentials
+        creds = aws_credentials or self.aws_credentials
 
-        for w_id in range(self.max_concurrent):
-            q = mp.Queue()
-            self.task_queues.append(q)
+        if self.use_multiprocessing:
+            # Start worker processes for parallel reading
+            for w_id in range(self.max_workers):
+                # The subset of URLs for this worker
+                urls_for_worker = self.worker_file_lists[w_id]
 
-            # The subset of URLs for this worker
-            urls_for_worker = self.worker_file_lists[w_id]
+                p = mp.Process(
+                    target=self._worker_main,
+                    args=(
+                        w_id,
+                        urls_for_worker,
+                        self.dset_name,
+                        creds,
+                        self.task_queues[w_id],
+                        self.result_queue,
+                    ),
+                )
+                p.start()
+                self.workers.append(p)
 
-            p = mp.Process(
-                target=worker_main,
-                args=(
-                    w_id,
-                    urls_for_worker,
-                    self.dset_name,
-                    self.aws_credentials,
-                    q,
-                    self.result_queue,
-                ),
+            logger.debug(
+                f"Started {len(self.workers)} worker processes for parallel reading"
             )
-            p.start()
-            self.workers.append(p)
+        else:
+            # Open all files directly
+            if self._is_s3:
+                for f in tqdm(self.filepaths, desc="Opening files"):
+                    ds = get_remote_h5(
+                        str(f), page_size=self.page_size, aws_credentials=creds
+                    )
+                    self.datasets.append(ds)
+            elif self._is_http:
+                from osgeo import gdal
+
+                for f in tqdm(self.filepaths, desc="Opening files"):
+                    ds = gdal.Open(str(f))
+                    self.datasets.append(ds)
+            else:
+                # Local files
+                for f in tqdm(self.filepaths, desc="Opening files"):
+                    ds = h5py.File(str(f), "r")
+                    self.datasets.append(ds)
 
         self._opened = True
-        logger.debug(
-            f"Started {len(self.workers)} worker processes for parallel reading"
-        )
+
+    @staticmethod
+    def _worker_main(
+        worker_id: int,
+        urls: list[str],
+        dset_name: str,
+        aws_credentials: Any,
+        request_queue: mp.Queue,
+        result_queue: mp.Queue,
+    ) -> None:
+        """Worker process function for multiprocessing mode.
+
+        Opens all the URLs assigned to this worker exactly once.
+        Then repeatedly waits for read requests on `request_queue`.
+        For each request, reads the slice from the appropriate open file
+        and puts the result on `result_queue`.
+
+        Parameters
+        ----------
+        worker_id : int
+            ID of the worker process.
+        urls : list[str]
+            List of URLs to read.
+        dset_name : str
+            Name of the dataset to read.
+        aws_credentials : AWSCredentials
+            AWS credentials for accessing S3.
+        request_queue : mp.Queue
+            Queue for read requests.
+        result_queue : mp.Queue
+            Queue for results.
+        """
+        # Open each file once
+        file_handles = {}
+        for url in urls:
+            try:
+                file_handles[url] = get_remote_h5(url, aws_credentials=aws_credentials)
+            except Exception as e:
+                logger.error(f"[Worker {worker_id}] Failed to open {url}: {str(e)}")
+                file_handles[url] = None
+
+        logger.debug(f"[Worker {worker_id}] opened {len(file_handles)} files")
+
+        while True:
+            msg = request_queue.get()
+            if msg is None:
+                # Sentinel -> time to shut down
+                break
+
+            idx, url, slice_obj = msg
+
+            # Read the data
+            fh = file_handles.get(url)
+            if fh is None:
+                # The file failed to open, send back an error
+                result_queue.put((idx, f"Error: Could not open {url}"))
+            else:
+                try:
+                    arr = fh[dset_name][slice_obj]
+                    # Return the array
+                    result_queue.put((idx, arr))
+                except Exception as e:
+                    result_queue.put((idx, f"Error reading {url}: {str(e)}"))
+
+        # Close all open handles
+        for h in file_handles.values():
+            if h is not None:
+                h.close()
+
+        logger.debug(f"[Worker {worker_id}] shutting down")
 
     def __getitem__(self, key):
-        """Get a slice of data from the stack using worker processes.
+        """Get a slice of data from the stack.
 
         Parameters
         ----------
@@ -537,58 +552,78 @@ class DispReaderPool:
         -------
         np.ndarray
             Data transformed from relative to absolute displacements.
+
+        Raises
+        ------
+        RuntimeError
+            If there's an error reading the data.
         """
         if not self._opened:
+            logger.debug("Reader not opened yet, opening now...")
             self.open()
 
         # Extract time and spatial keys
         if isinstance(key, tuple):
-            time_key = key[0]
+            # time_key = key[0]
             spatial_key = key[1:]
         else:
-            time_key = key
+            # time_key = key
             spatial_key = (slice(None), slice(None))
 
-        # Submit tasks to worker processes
-        for i, url in enumerate(self.filepaths):
-            # self.task_queue.put((i, str(url), self.dset_name, spatial_key))
-            w_id = self.url_to_worker[url]
-            self.task_queues[w_id].put((i, url, spatial_key))
+        if self.use_multiprocessing:
+            # Submit tasks to worker processes
+            for i, url in enumerate(self.filepaths):
+                w_id = self.url_to_worker[str(url)]
+                self.task_queues[w_id].put((i, str(url), spatial_key))
 
-        # Collect results with progress tracking
-        results = [None] * len(self.filepaths)
-        for _ in tqdm(range(len(self.filepaths)), desc="Reading data"):
-            i, data = self.result_queue.get()
-            if isinstance(data, str):  # Error message
-                raise RuntimeError(f"Error processing file {i}: {data}")
-            results[i] = data
+            # Collect results with progress tracking
+            results = [None] * len(self.filepaths)
+            for _ in tqdm(range(len(self.filepaths)), desc="Reading data"):
+                i, data = self.result_queue.get()
+                if isinstance(data, str):  # Error message
+                    raise RuntimeError(f"Error processing file {i}: {data}")
+                results[i] = data
 
-        # Stack the results
-        data = np.stack(results)
-        cur_shape = data.shape
+            # Stack the results
+            data = np.stack(results)
+        else:
+            # Read the data from each file directly
+            data = []
+            for ds in tqdm(self.datasets, desc="Reading data"):
+                data.append(ds[self.dset_name][spatial_key])
+            data = np.stack(data)
 
         # Transform from relative to absolute displacements
+        cur_shape = data.shape
         return (self.incidence_pinv @ data.reshape(cur_shape[0], -1)).reshape(cur_shape)
 
-    def close(self):
-        """Close all worker processes and clean up resources."""
+    def close(self) -> None:
+        """Close all open datasets or worker processes."""
         if not self._opened:
             return
 
-        # Send sentinel values to stop workers
-        for q in self.task_queues:
-            q.put(None)
+        if self.use_multiprocessing:
+            # Send sentinel values to stop workers
+            for q in self.task_queues:
+                q.put(None)
 
-        # Wait for workers to finish
-        for p in self.workers:
-            p.join(timeout=1.0)
-            if p.is_alive():
-                p.terminate()
+            # Wait for workers to finish with timeout
+            for p in self.workers:
+                p.join(timeout=1.0)
+                if p.is_alive():
+                    p.terminate()
 
-        # Clean up
-        self.workers = []
+            # Clean up
+            self.workers = []
+            logger.debug("All worker processes stopped")
+        else:
+            # Close all open datasets
+            for ds in self.datasets:
+                ds.close()
+            self.datasets = []
+
         self._opened = False
-        logger.debug("All worker processes stopped")
 
     def __del__(self):
+        """Ensure resources are cleaned up when the object is garbage collected."""
         self.close()
