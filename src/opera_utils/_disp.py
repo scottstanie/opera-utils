@@ -463,6 +463,7 @@ class DispReader:
                         creds,
                         self.task_queues[w_id],
                         self.result_queue,
+                        self._is_s3,
                     ),
                 )
                 p.start()
@@ -502,6 +503,7 @@ class DispReader:
         aws_credentials: Any,
         request_queue: mp.Queue,
         result_queue: mp.Queue,
+        is_s3: bool,
     ) -> None:
         """Worker process function for multiprocessing mode.
 
@@ -524,12 +526,23 @@ class DispReader:
             Queue for read requests.
         result_queue : mp.Queue
             Queue for results.
+        is_s3 : bool
+            True if running on an Ec2 with direct access to s3.
         """
+        from osgeo import gdal
+
         # Open each file once
         file_handles = {}
         for url in urls:
             try:
-                file_handles[url] = get_remote_h5(url, aws_credentials=aws_credentials)
+                if is_s3:
+                    file_handles[url] = get_remote_h5(
+                        url, aws_credentials=aws_credentials
+                    )
+                else:
+                    gdal_str = f'HDF5:"/vsicurl/{url}"://{dset_name.strip("/")}'
+                    ds = gdal.Open(gdal_str)
+                    file_handles[url] = ds
             except Exception as e:
                 logger.error(f"[Worker {worker_id}] Failed to open {url}: {str(e)}")
                 file_handles[url] = None
@@ -551,7 +564,15 @@ class DispReader:
                 result_queue.put((idx, f"Error: Could not open {url}"))
             else:
                 try:
-                    arr = fh[dset_name][slice_obj]
+                    if is_s3:
+                        arr = fh[dset_name][slice_obj]
+                    else:
+                        # TODO: Need to store the image size to cut off edges same as slice
+                        xoff, yoff, xsize, ysize = _slice_to_offsets(
+                            *slice_obj,
+                        )
+                        arr = ds.ReadAsArray(xoff, yoff, xsize, ysize)
+
                     # Return the array
                     result_queue.put((idx, arr))
                 except Exception as e:
