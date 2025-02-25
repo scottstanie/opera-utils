@@ -10,11 +10,9 @@ from typing import Literal, TypeVar
 import h5netcdf
 import h5py
 import numpy as np
-from pyproj import Transformer
 from tqdm.auto import tqdm
 
 from ._dates import get_dates
-from ._types import Bbox
 from ._utils import flatten
 from .burst_frame_db import get_frame_bbox
 from .constants import DISP_FILE_REGEX
@@ -170,8 +168,6 @@ class DispReader:
         )
         self.incidence_pinv = np.linalg.pinv(self.incidence_matrix)
 
-        # Create a mapping of dates to indices for the time dimension
-        self.date_to_idx = {d: i for i, d in enumerate(self.unique_dates)}
         self.aws_credentials = aws_credentials
         self._opened = False
         self.datasets = []
@@ -224,14 +220,8 @@ class DispReader:
             data.append(ds[self.dset_name][spatial_key])
         data = np.stack(data)
 
-        # Transform from relative to absolute displacements
-        # transformed = np.tensordot(self.incidence_pinv, data, axes=([1], [0]))
-        transformed = self.incidence_pinv @ data
-
-        # Return the requested time slice
-        if isinstance(time_key, slice):
-            return transformed[time_key]
-        return transformed[time_key]
+        cur_shape = data.shape
+        return (self.incidence_pinv @ data.reshape(cur_shape[0], -1)).reshape(cur_shape)
 
     def close(self):
         """Close all open datasets."""
@@ -343,181 +333,8 @@ def get_geospatial_metadata(frame_id: int) -> dict:
     }
 
 
-def utm_to_rowcol(
-    utm_x: float,
-    utm_y: float,
-    geotransform: tuple[float, float, float, float, float, float],
-) -> tuple[int, int]:
-    """
-    Convert UTM coordinates to pixel row and column indices using the provided geotransform.
-
-    Parameters
-    ----------
-    utm_x : float
-        The UTM x coordinate.
-    utm_y : float
-        The UTM y coordinate.
-    geotransform : tuple
-        Geotransform tuple of the form
-        (xmin, pixel_width, 0, ymax, 0, pixel_height),
-        where pixel_height is negative for top-down images.
-
-    Returns
-    -------
-    tuple[int, int]
-        (row, col) indices corresponding to the UTM coordinate.
-    """
-    xmin, pixel_width, _, ymax, _, pixel_height = geotransform
-    col = int(round((utm_x - xmin) / pixel_width))
-    row = int(round((ymax - utm_y) / abs(pixel_height)))
-    return row, col
-
-
-def lonlat_to_utm(lon: float, lat: float, utm_crs) -> tuple[float, float]:
-    """
-    Convert geographic coordinates (longitude, latitude) to UTM coordinates using a target CRS.
-
-    Parameters
-    ----------
-    lon : float
-        Longitude in degrees.
-    lat : float
-        Latitude in degrees.
-    utm_crs : pyproj.CRS
-        Target UTM coordinate system (typically from get_geospatial_metadata).
-
-    Returns
-    -------
-    tuple[float, float]
-        (utm_x, utm_y) coordinates.
-    """
-    transformer = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
-    utm_x, utm_y = transformer.transform(lon, lat)
-    return utm_x, utm_y
-
-
-def lonlat_to_rowcol(
-    lon: float,
-    lat: float,
-    geotransform: tuple[float, float, float, float, float, float],
-    utm_crs,
-) -> tuple[int, int]:
-    """
-    Convert geographic coordinates (lon, lat) to pixel row and column indices.
-
-    This function transforms the (lon, lat) pair to UTM
-    and then computes the corresponding pixel indices using the provided geotransform.
-
-    Parameters
-    ----------
-    lon : float
-        Longitude in degrees.
-    lat : float
-        Latitude in degrees.
-    geotransform : tuple
-        Geotransform tuple (xmin, pixel_width, 0, ymax, 0, pixel_height).
-    utm_crs : pyproj.CRS
-        Target UTM coordinate system.
-
-    Returns
-    -------
-    tuple[int, int]
-        (row, col) indices.
-    """
-    utm_x, utm_y = lonlat_to_utm(lon, lat, utm_crs)
-    return utm_to_rowcol(utm_x, utm_y, geotransform)
-
-
-def bbox_lonlat_to_utm(bbox: Bbox, utm_crs) -> Bbox:
-    """
-    Convert a bounding box in geographic coordinates (lon, lat) to UTM coordinates.
-
-    The input Bbox has attributes (left, bottom, right, top) in lon/lat.
-    The function transforms all four corners and then determines the
-    new bounding box in UTM.
-
-    Parameters
-    ----------
-    bbox : Bbox
-        Bounding box in lon/lat.
-    utm_crs : pyproj.CRS
-        Target UTM coordinate system.
-
-    Returns
-    -------
-    Bbox
-        Bounding box in UTM coordinates.
-    """
-    transformer = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
-    # Transform each corner: lower-left, upper-left, lower-right, upper-right
-    ll = transformer.transform(bbox.left, bbox.bottom)
-    lt = transformer.transform(bbox.left, bbox.top)
-    rl = transformer.transform(bbox.right, bbox.bottom)
-    rt = transformer.transform(bbox.right, bbox.top)
-    xs = [ll[0], lt[0], rl[0], rt[0]]
-    ys = [ll[1], lt[1], rl[1], rt[1]]
-    return Bbox(left=min(xs), bottom=min(ys), right=max(xs), top=max(ys))
-
-
-def bbox_utm_to_rowcol(
-    bbox: Bbox, geotransform: tuple[float, float, float, float, float, float]
-) -> tuple[int, int, int, int]:
-    """
-    Convert a bounding box in UTM coordinates to pixel row/column indices.
-
-    The provided geotransform should be of the form
-        (xmin, pixel_width, 0, ymax, 0, pixel_height)
-    with pixel_height negative for top-down orientation.
-
-    Parameters
-    ----------
-    bbox : Bbox
-        Bounding box in UTM coordinates (left, bottom, right, top).
-    geotransform : tuple
-        Geotransform tuple as described above.
-
-    Returns
-    -------
-    tuple[int, int, int, int]
-        Pixel indices as (row_min, row_max, col_min, col_max).
-    """
-    # Use the top-left corner for the minimum indices...
-    row_min, col_min = utm_to_rowcol(bbox.left, bbox.top, geotransform)
-    # ...and the bottom-right for the maximum indices.
-    row_max, col_max = utm_to_rowcol(bbox.right, bbox.bottom, geotransform)
-    return row_min, row_max, col_min, col_max
-
-
-def bbox_lonlat_to_rowcol(
-    bbox: Bbox, geotransform: tuple[float, float, float, float, float, float], utm_crs
-) -> tuple[int, int, int, int]:
-    """
-    Convert a bounding box in geographic coordinates (lon, lat) to pixel row and column indices.
-
-    This function transforms the Bbox from lon/lat to UTM using the provided target CRS,
-    then computes the pixel indices using the geotransform.
-
-    Parameters
-    ----------
-    bbox : Bbox
-        Bounding box in lon/lat (left, bottom, right, top).
-    geotransform : tuple
-        Geotransform tuple (xmin, pixel_width, 0, ymax, 0, pixel_height).
-    utm_crs : pyproj.CRS
-        Target UTM coordinate system.
-
-    Returns
-    -------
-    tuple[int, int, int, int]
-        (row_min, row_max, col_min, col_max) pixel indices.
-    """
-    utm_bbox = bbox_lonlat_to_utm(bbox, utm_crs)
-    return bbox_utm_to_rowcol(utm_bbox, geotransform)
-
-
 import multiprocessing as mp
 import sys
-from multiprocessing import Process
 from typing import Any, Dict, List
 
 
@@ -545,9 +362,6 @@ def worker_process(
     """
     print(f"Worker {worker_id} started", file=sys.stderr)
 
-    # Keep a cache of open file handles
-    open_files = {}
-
     while True:
         try:
             # Get a task from the queue
@@ -555,63 +369,84 @@ def worker_process(
 
             # None is the sentinel value to stop the worker
             if task is None:
-                print(
-                    f"Worker {worker_id} shutting down, closing {len(open_files)} files",
-                    file=sys.stderr,
-                )
-                # Close all open files
-                for url, h5_file in open_files.items():
-                    try:
-                        h5_file.close()
-                    except:
-                        pass
+                print(f"Worker {worker_id} shutting down", file=sys.stderr)
                 break
-
-            # Check if it's a command to close specific file
-            if isinstance(task, tuple) and len(task) >= 1 and task[0] == "close_file":
-                _, url = task
-                if url in open_files:
-                    try:
-                        open_files[url].close()
-                        del open_files[url]
-                        print(f"Worker {worker_id} closed file {url}", file=sys.stderr)
-                    except Exception as e:
-                        print(
-                            f"Worker {worker_id} error closing file {url}: {str(e)}",
-                            file=sys.stderr,
-                        )
-                continue
 
             job_id, url, dset_name, spatial_key = task
 
             try:
-                # Check if file is already open
-                if url not in open_files:
-                    # Open the H5 file and keep it in the cache
-                    open_files[url] = get_remote_h5(
-                        url, page_size=page_size, aws_credentials=aws_credentials
-                    )
-
-                # Read the data from the cached file
-                data = open_files[url][dset_name][spatial_key]
+                # Open the H5 file, read data, and close immediately
+                h5_file = get_remote_h5(
+                    url, page_size=page_size, aws_credentials=aws_credentials
+                )
+                data = h5_file[dset_name][spatial_key]
+                h5_file.close()
                 result_queue.put((job_id, data))
             except Exception as e:
                 print(
                     f"Worker {worker_id} error on file {url}: {str(e)}", file=sys.stderr
                 )
-                # Try to close and remove the file if it caused an error
-                if url in open_files:
-                    try:
-                        open_files[url].close()
-                    except:
-                        pass
-                    del open_files[url]
                 result_queue.put((job_id, f"Error reading {url}: {str(e)}"))
 
         except Exception as e:
             print(f"Worker {worker_id} unexpected error: {str(e)}", file=sys.stderr)
             # In case of unexpected error, continue running
             continue
+
+
+def worker_main(
+    worker_id, urls_for_worker, dset_name, aws_credentials, request_queue, result_queue
+):
+    """
+    Opens all the URLs assigned to this worker exactly once.
+    Then repeatedly waits for read requests on `request_queue`.
+    For each request, reads the slice from the appropriate open file
+    and puts the result on `result_queue`.
+    """
+
+    # Open each file once
+    file_handles = {}
+    for url in urls_for_worker:
+        file_handles[url] = get_remote_h5(url, aws_credentials=aws_credentials)
+        # try:
+        #     file_handles[url] = get_remote_h5(url, aws_credentials=aws_credentials)
+        # except Exception as e:
+        #     # If open fails, store None or raise
+        #     file_handles[url] = None
+        #     print(
+        #         f"[Worker {worker_id}] Error opening {url}: {str(e)}", file=sys.stderr
+        #     )
+
+    print(f"[Worker {worker_id}] opened {len(file_handles)} files", file=sys.stderr)
+
+    while True:
+        msg = request_queue.get()
+        if msg is None:
+            # Sentinel -> time to shut down
+            break
+
+        idx, url, slice_obj = msg
+
+        # Read the data
+        # (We assume 'dset_name' exists in the opened file)
+        fh = file_handles[url]
+        if fh is None:
+            # The file failed to open, send back an error
+            result_queue.put((idx, f"Error: Could not open {url}"))
+        else:
+            try:
+                arr = fh[dset_name][slice_obj]
+                # Return the array
+                result_queue.put((idx, arr))
+            except Exception as e:
+                result_queue.put((idx, f"Error reading {url}: {str(e)}"))
+
+    # Close all open handles
+    for h in file_handles.values():
+        if h is not None:
+            h.close()
+
+    print(f"[Worker {worker_id}] shutting down", file=sys.stderr)
 
 
 class DispReaderPool:
@@ -666,11 +501,23 @@ class DispReaderPool:
         )
         self.incidence_pinv = np.linalg.pinv(self.incidence_matrix)
 
-        # Create a mapping of dates to indices for the time dimension
-        self.date_to_idx = {d: i for i, d in enumerate(self.unique_dates)}
+        # 1) Partition the filepaths across workers
+        # E.g. round-robin or hash or chunk them
+        # Simple round-robin approach:
+        self.worker_file_lists = [[] for _ in range(max_concurrent)]
+        for i, url in enumerate(self.filepaths):
+            w_id = i % max_concurrent
+            self.worker_file_lists[w_id].append(url)
+
+        # 2) Make a lookup: which worker ID is responsible for each URL?
+        self.url_to_worker = {}
+        for w_id, url_list in enumerate(self.worker_file_lists):
+            for url in url_list:
+                self.url_to_worker[url] = w_id
 
         # Initialize multiprocessing resources
-        self.task_queue = mp.Queue()
+        # self.task_queue = mp.Queue()
+        self.task_queues: list[mp.Queue] = []
         self.result_queue = mp.Queue()
         self.workers = []
         self._opened = False
@@ -690,19 +537,24 @@ class DispReaderPool:
         # Make sure credentials are set
         self.aws_credentials = aws_credentials or self.aws_credentials
 
-        # Start worker processes
-        for i in range(self.max_concurrent):
-            p = Process(
-                target=worker_process,
+        for w_id in range(self.max_concurrent):
+            q = mp.Queue()
+            self.task_queues.append(q)
+
+            # The subset of URLs for this worker
+            urls_for_worker = self.worker_file_lists[w_id]
+
+            p = mp.Process(
+                target=worker_main,
                 args=(
-                    self.task_queue,
-                    self.result_queue,
-                    i,
+                    w_id,
+                    urls_for_worker,
+                    self.dset_name,
                     self.aws_credentials,
-                    self.page_size,
+                    q,
+                    self.result_queue,
                 ),
             )
-            p.daemon = True
             p.start()
             self.workers.append(p)
 
@@ -733,44 +585,19 @@ class DispReaderPool:
             time_key = key
             spatial_key = (slice(None), slice(None))
 
-        # Use streaming approach - submit initial batch, then submit more as results arrive
+        # Submit tasks to worker processes
+        for i, url in enumerate(self.filepaths):
+            # self.task_queue.put((i, str(url), self.dset_name, spatial_key))
+            w_id = self.url_to_worker[url]
+            self.task_queues[w_id].put((i, url, spatial_key))
+
+        # Collect results with progress tracking
         results = [None] * len(self.filepaths)
-        submitted = 0
-        received = 0
-        total = len(self.filepaths)
-
-        # Submit initial batch (2x worker count to ensure workers stay busy)
-        initial_batch = min(self.max_concurrent * 2, total)
-        for i in range(initial_batch):
-            self.task_queue.put(
-                (i, str(self.filepaths[i]), self.dset_name, spatial_key)
-            )
-            submitted += 1
-
-        # Process results and submit new tasks as they complete
-        with tqdm(total=total, desc="Reading data") as pbar:
-            while received < total:
-                # Get a result
-                job_id, data = self.result_queue.get()
-                received += 1
-
-                if isinstance(data, str):  # Error message
-                    raise RuntimeError(f"Error processing file {job_id}: {data}")
-
-                results[job_id] = data
-                pbar.update(1)
-
-                # Submit a new task if there are more to process
-                if submitted < total:
-                    self.task_queue.put(
-                        (
-                            submitted,
-                            str(self.filepaths[submitted]),
-                            self.dset_name,
-                            spatial_key,
-                        )
-                    )
-                    submitted += 1
+        for _ in tqdm(range(len(self.filepaths)), desc="Reading data"):
+            i, data = self.result_queue.get()
+            if isinstance(data, str):  # Error message
+                raise RuntimeError(f"Error processing file {i}: {data}")
+            results[i] = data
 
         # Stack the results
         data = np.stack(results)
@@ -785,12 +612,12 @@ class DispReaderPool:
             return
 
         # Send sentinel values to stop workers
-        for _ in range(len(self.workers)):
-            self.task_queue.put(None)
+        for q in self.task_queues:
+            q.put(None)
 
         # Wait for workers to finish
         for p in self.workers:
-            p.join(timeout=2.0)
+            p.join(timeout=1.0)
             if p.is_alive():
                 p.terminate()
 
@@ -799,20 +626,174 @@ class DispReaderPool:
         self._opened = False
         print("All worker processes stopped")
 
-    def close_file(self, url):
-        """Close a specific file across all workers.
+    def __del__(self):
+        self.close()
 
-        Parameters
-        ----------
-        url : str
-            URL of the file to close
-        """
-        if not self._opened:
+
+class DispReaderPoolPinned:
+    """
+    Example showing how to "pin" each URL to exactly one worker, which
+    opens it once and does all slice-reads for that file.
+    """
+
+    def __init__(
+        self,
+        filepaths: List[str],
+        dset_name: str = "displacement",
+        aws_credentials: Dict = None,
+        max_workers: int = 4,
+    ):
+        self.filepaths = list(filepaths)
+        self.dset_name = dset_name
+        self.aws_credentials = aws_credentials
+        self.max_workers = max_workers
+
+        # Optionally sort or parse times, build incidence matrix, etc.
+        # For brevity, omitted here.
+
+        # 1) Partition the filepaths across workers
+        # E.g. round-robin or hash or chunk them
+        # Simple round-robin approach:
+        self.worker_file_lists = [[] for _ in range(max_workers)]
+        for i, url in enumerate(self.filepaths):
+            w_id = i % max_workers
+            self.worker_file_lists[w_id].append(url)
+
+        # 2) Make a lookup: which worker ID is responsible for each URL?
+        self.url_to_worker = {}
+        for w_id, url_list in enumerate(self.worker_file_lists):
+            for url in url_list:
+                self.url_to_worker[url] = w_id
+
+        # 3) Create a request queue & result queue for each worker
+        self.task_queues = []
+        self.workers = []
+        self.result_queue = mp.Queue()
+
+    def open(self):
+        """Spin up the worker processes and open the assigned files."""
+        # Do nothing if already open
+        if self.workers:
             return
 
-        # Send close command to all workers
-        for _ in range(len(self.workers)):
-            self.task_queue.put(("close_file", url))
+        for w_id in range(self.max_workers):
+            q = mp.Queue()
+            self.task_queues.append(q)
+
+            # The subset of URLs for this worker
+            urls_for_worker = self.worker_file_lists[w_id]
+
+            p = mp.Process(
+                target=worker_main,
+                args=(
+                    w_id,
+                    urls_for_worker,
+                    self.dset_name,
+                    self.ros3_kwargs,
+                    q,
+                    self.result_queue,
+                ),
+            )
+            p.start()
+            self.workers.append(p)
+
+        print(f"Started {len(self.workers)} workers.", file=sys.stderr)
+
+    def close(self):
+        """Shut down all workers."""
+        for q in self.task_queues:
+            q.put(None)  # sentinel
+
+        for p in self.workers:
+            p.join(timeout=3)
+            if p.is_alive():
+                p.terminate()
+
+        self.workers = []
+        self.task_queues = []
+        print("All workers closed", file=sys.stderr)
 
     def __del__(self):
         self.close()
+
+    def __getitem__(self, key):
+        """Get a slice of data from the stack using worker processes.
+
+        Parameters
+        ----------
+        key : tuple[slice | int]
+            Tuple of slices/indices into (time, y, x) dimensions.
+
+        Returns
+        -------
+        np.ndarray
+            Data transformed from relative to absolute displacements.
+        """
+        if not self._opened:
+            self.open()
+
+        # Extract time and spatial keys
+        if isinstance(key, tuple):
+            time_key = key[0]
+            spatial_key = key[1:]
+        else:
+            time_key = key
+            spatial_key = (slice(None), slice(None))
+
+        # Submit tasks to worker processes
+        for i, url in enumerate(self.filepaths):
+            # self.task_queue.put((i, str(url), self.dset_name, spatial_key))
+            w_id = self.url_to_worker[url]
+            self.task_queues[w_id].put((i, url, spatial_key))
+
+        # Collect results with progress tracking
+        results = [None] * len(self.filepaths)
+        for _ in tqdm(range(len(self.filepaths)), desc="Reading data"):
+            job_id, data = self.result_queue.get()
+            if isinstance(data, str):  # Error message
+                raise RuntimeError(f"Error processing file {job_id}: {data}")
+            results[job_id] = data
+
+        # Stack the results
+        data = np.stack(results)
+        cur_shape = data.shape
+
+        # Transform from relative to absolute displacements
+        return (self.incidence_pinv @ data.reshape(cur_shape[0], -1)).reshape(cur_shape)
+
+    def read_slice(self, url: str, slice_obj):
+        """
+        Enqueue a read request for `url` with the given slice object.
+        """
+        if not self.workers:
+            self.open()
+
+        w_id = self.url_to_worker[url]
+        self.task_queues[w_id].put((url, slice_obj))
+
+    def get_one_result(self):
+        """
+        Blocks until one result arrives in `result_queue`.
+        Returns (request_id, np_array_or_error).
+        """
+        return self.result_queue.get()
+
+    def read_many_slices(self, requests):
+        """
+        requests is a list of (url, slice_obj).
+        We submit them all, then gather results.
+        Return them in a dict or list.
+        """
+        # 1) Submit all
+        results_pending = {}
+        for url, slice_obj in requests:
+            req_id = self.read_slice(url, slice_obj)
+            results_pending[req_id] = (url, slice_obj)
+
+        # 2) Collect them all
+        final_results = {}
+        for _ in range(len(requests)):
+            req_id, arr_or_err = self.get_one_result()
+            final_results[req_id] = arr_or_err
+
+        return final_results

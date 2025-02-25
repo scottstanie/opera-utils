@@ -1,7 +1,7 @@
 import argparse
 import time
 
-from opera_utils._disp import DispReaderPool
+from opera_utils import _disp
 from opera_utils.credentials import get_earthaccess_s3_creds
 
 
@@ -45,13 +45,30 @@ def main():
 
     # Create and use the reader
     t0 = time.time()
-    reader = DispReaderPool(
+    reader = _disp.DispReaderPool(
         urls,
         page_size=args.page_size,
         max_concurrent=args.max_concurrent,
         aws_credentials=aws_credentials,
     )
-    print(f"Created in in {time.time() - t0:.2f} seconds")
+
+    # reader = _disp.DispReaderQueue(
+    #     urls,
+    #     n_workers=args.max_concurrent,
+    #     aws_credentials=aws_credentials,
+    # )
+    # print(f"Created in in {time.time() - t0:.2f} seconds")
+
+    # # Example "requests" to read slices from 2 of the files
+    # my_requests = [
+    #     (0, (slice(100, 101), slice(None), slice(None))),  # from file 0
+    #     (1, (slice(50, ), slice(None), slice(None))),  # from file 1
+    # ]
+    # results = reader.read_slices(my_requests)
+    # # # Now do something with the arrays
+    # # # e.g. results might be {1: np.array(...), 2: np.array(...)}
+    # # # You can re-assemble them in the order you prefer.
+    # # reader.close()
 
     t0 = time.time()
     reader.open()
