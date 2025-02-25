@@ -1,15 +1,17 @@
 from __future__ import annotations
 
-import itertools
+import logging
+import multiprocessing as mp
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, TypeVar
+from typing import Literal, NamedTuple, TypeVar
 
 import h5netcdf
 import h5py
 import numpy as np
+import pyproj
 from tqdm.auto import tqdm
 
 from ._dates import get_dates
@@ -23,6 +25,8 @@ __all__ = [
     "OperaDispFile",
     "parse_disp_datetimes",
 ]
+
+logger = logging.getLogger("opera_utils")
 
 
 @dataclass
@@ -68,22 +72,6 @@ def parse_disp_datetimes(
     return reference_times, secondary_times, generation_times
 
 
-def _get_first_file_per_ministack(
-    opera_file_list: Sequence[Path | str],
-) -> list[Path | str]:
-    def _get_generation_time(fname):
-        return parse_disp_datetimes([fname])[2][0]
-
-    first_per_ministack = []
-    for d, cur_groupby in itertools.groupby(
-        sorted(opera_file_list), key=_get_generation_time
-    ):
-        # cur_groupby is an iterable of all matching
-        # Get the first one
-        first_per_ministack.append(next(cur_groupby))
-    return first_per_ministack
-
-
 def get_remote_h5(
     url: str,
     aws_credentials: AWSCredentials | None = None,
@@ -125,7 +113,7 @@ class DispReader:
     Parameters
     ----------
     filepaths : list[str | Path]
-        List of paths to OPERA DISP-S1 files to read.
+        list of paths to OPERA DISP-S1 files to read.
     page_size : int, optional
         Page size in bytes for HDF5 file system page strategy. Default is 4 MB.
     """
@@ -204,8 +192,9 @@ class DispReader:
             Data transformed from relative to absolute displacements.
         """
         if not self._opened:
-            print("Not opened yet, running...")
+            logging.debug("Not opened yet, running...")
             self.open()
+
         # Get the time slice/index
         if isinstance(key, tuple):
             time_key = key[0]
@@ -243,7 +232,7 @@ def get_incidence_matrix(
     Parameters
     ----------
     ifg_pairs : Sequence[tuple[T, T]]
-        List of ifg pairs represented as tuples of (day 1, day 2)
+        list of ifg pairs represented as tuples of (day 1, day 2)
         Can be ints, datetimes, etc.
     sar_idxs : Sequence[T], optional
         If provided, used as the total set of indexes which `ifg_pairs`
@@ -285,120 +274,101 @@ def get_incidence_matrix(
     return A
 
 
-def get_geospatial_metadata(frame_id: int) -> dict:
+class GeoTransform(NamedTuple):
+    """Named tuple for a GDAL Geotransform tuple.
+
+    References
+    ----------
+    https://gdal.org/en/stable/tutorials/geotransforms_tut.html
     """
-    Get the geospatial metadata for a given frame.
 
-    This function retrieves the bounding box and EPSG code for the specified frame
-    using `get_frame_bbox`, then constructs a geotransform based on known properties:
-    - The image is always in UTM.
-    - Pixel spacing is fixed at 30 m by 30 m.
-    - The geotransform is defined as (top left x, pixel width, rotation_x, top left y, rotation_y, pixel height),
-      where the top left coordinate is (xmin, ymax) because y typically decreases downward in raster data.
+    top_left_x: float
+    pixel_width: float
+    rotation_x: float
+    top_left_y: float
+    pixel_height: float
+    rotation_y: float
 
-    Additionally, the full CRS object is constructed using pyproj.
+
+@dataclass
+class FrameMetadata:
+    crs: pyproj.CRS
+    bbox: tuple[float, float, float, float]
+    geotransform: GeoTransform
+
+    @property
+    def resolution(self) -> tuple[float, float]:
+        """Resolution of the geospatial data."""
+        return (self.geotransform.pixel_width, self.geotransform.pixel_height)
+
+    @classmethod
+    def from_frame_id(cls, frame_id: int) -> "FrameMetadata":
+        """
+        Get the geospatial metadata for a given frame.
+
+        This function retrieves the bounding box and EPSG code for the specified frame
+        using `get_frame_bbox`, then constructs a geotransform based on known properties:
+        - The image is always in UTM.
+        - Pixel spacing is fixed at 30 m by 30 m.
+        - The geotransform is defined as (top left x, pixel width, rotation_x, top left y, rotation_y, pixel height),
+        where the top left coordinate is (xmin, ymax) because y typically decreases downward in raster data.
+
+        Additionally, the full CRS object is constructed using pyproj.
+
+        Parameters
+        ----------
+        frame_id : int
+            The ID of the frame to get metadata for.
+
+        Returns
+        -------
+        FrameMetadata
+            Dataclass containing Frame's geospatial metadata
+        """
+        # Retrieve the EPSG and bounding box, e.g. (xmin, ymin, xmax, ymax)
+        epsg, bbox = get_frame_bbox(frame_id)
+        crs = pyproj.CRS.from_epsg(epsg)
+
+        xmin, ymin, xmax, ymax = bbox
+        return cls(
+            crs=crs, bbox=bbox, geotransform=GeoTransform(xmin, 30, 0, ymax, 0, -30)
+        )
+
+
+def utm_to_rowcol(
+    utm_x: float,
+    utm_y: float,
+    geotransform: tuple[float, float, float, float, float, float],
+) -> tuple[int, int]:
+    """
+    Convert UTM coordinates to pixel row and column indices using the provided geotransform.
 
     Parameters
     ----------
-    frame_id : int
-        The ID of the frame to get metadata for.
+    utm_x : float
+        The UTM x coordinate.
+    utm_y : float
+        The UTM y coordinate.
+    geotransform : tuple
+        Geotransform tuple of the form
+        (xmin, pixel_width, 0, ymax, 0, pixel_height),
+        where pixel_height is negative for top-down images.
 
     Returns
     -------
-    dict
-        A dictionary containing:
-          - "crs": pyproj CRS object based on the EPSG code.
-          - "bbox": tuple of (xmin, ymin, xmax, ymax).
-          - "geotransform": tuple (top left x, pixel width, 0, top left y, 0, pixel height)
-            where pixel height is negative for a top-down image orientation.
-          - "resolution": (30, 30)
+    tuple[int, int]
+        (row, col) indices corresponding to the UTM coordinate.
     """
-    import pyproj
-
-    # Retrieve the EPSG and bounding box, e.g. (xmin, ymin, xmax, ymax)
-    epsg, bbox = get_frame_bbox(frame_id)
-    crs = pyproj.CRS.from_epsg(epsg)
-
-    xmin, ymin, xmax, ymax = bbox
-    # Construct the geotransform.
-    # Top left coordinate: (xmin, ymax)
-    # Pixel width: 30, and pixel height is -30 (negative because it goes downward)
-    geotransform = (xmin, 30, 0, ymax, 0, -30)
-
-    return {
-        "crs": crs,
-        "bbox": bbox,
-        "geotransform": geotransform,
-        "resolution": (30, 30),
-    }
-
-
-import multiprocessing as mp
-import sys
-from typing import Any, Dict, List
-
-
-def worker_process(
-    task_queue: mp.Queue,
-    result_queue: mp.Queue,
-    worker_id: int,
-    aws_credentials: Dict[str, Any],
-    page_size: int,
-):
-    """Worker process to read data from remote H5 files.
-
-    Parameters
-    ----------
-    task_queue : mp.Queue
-        Queue for receiving tasks from the main process
-    result_queue : mp.Queue
-        Queue for sending results back to the main process
-    worker_id : int
-        Unique ID for this worker
-    aws_credentials : Dict[str, Any]
-        AWS credentials for accessing S3
-    page_size : int
-        Page size for HDF5 file system page strategy
-    """
-    print(f"Worker {worker_id} started", file=sys.stderr)
-
-    while True:
-        try:
-            # Get a task from the queue
-            task = task_queue.get()
-
-            # None is the sentinel value to stop the worker
-            if task is None:
-                print(f"Worker {worker_id} shutting down", file=sys.stderr)
-                break
-
-            job_id, url, dset_name, spatial_key = task
-
-            try:
-                # Open the H5 file, read data, and close immediately
-                h5_file = get_remote_h5(
-                    url, page_size=page_size, aws_credentials=aws_credentials
-                )
-                data = h5_file[dset_name][spatial_key]
-                h5_file.close()
-                result_queue.put((job_id, data))
-            except Exception as e:
-                print(
-                    f"Worker {worker_id} error on file {url}: {str(e)}", file=sys.stderr
-                )
-                result_queue.put((job_id, f"Error reading {url}: {str(e)}"))
-
-        except Exception as e:
-            print(f"Worker {worker_id} unexpected error: {str(e)}", file=sys.stderr)
-            # In case of unexpected error, continue running
-            continue
+    xmin, pixel_width, _, ymax, _, pixel_height = geotransform
+    col = int(round((utm_x - xmin) / pixel_width))
+    row = int(round((ymax - utm_y) / abs(pixel_height)))
+    return row, col
 
 
 def worker_main(
     worker_id, urls_for_worker, dset_name, aws_credentials, request_queue, result_queue
 ):
-    """
-    Opens all the URLs assigned to this worker exactly once.
+    """Opens all the URLs assigned to this worker exactly once.
     Then repeatedly waits for read requests on `request_queue`.
     For each request, reads the slice from the appropriate open file
     and puts the result on `result_queue`.
@@ -408,16 +378,8 @@ def worker_main(
     file_handles = {}
     for url in urls_for_worker:
         file_handles[url] = get_remote_h5(url, aws_credentials=aws_credentials)
-        # try:
-        #     file_handles[url] = get_remote_h5(url, aws_credentials=aws_credentials)
-        # except Exception as e:
-        #     # If open fails, store None or raise
-        #     file_handles[url] = None
-        #     print(
-        #         f"[Worker {worker_id}] Error opening {url}: {str(e)}", file=sys.stderr
-        #     )
 
-    print(f"[Worker {worker_id}] opened {len(file_handles)} files", file=sys.stderr)
+    logger.debug(f"[Worker {worker_id}] opened {len(file_handles)} files")
 
     while True:
         msg = request_queue.get()
@@ -446,7 +408,7 @@ def worker_main(
         if h is not None:
             h.close()
 
-    print(f"[Worker {worker_id}] shutting down", file=sys.stderr)
+    logger.debug(f"[Worker {worker_id}] shutting down")
 
 
 class DispReaderPool:
@@ -455,12 +417,12 @@ class DispReaderPool:
     Parameters
     ----------
     filepaths : list[str | Path]
-        List of paths to OPERA DISP-S1 files to read.
+        list of paths to OPERA DISP-S1 files to read.
     page_size : int, optional
         Page size in bytes for HDF5 file system page strategy. Default is 4 MB.
     dset_name : Literal["displacement", "short_wavelength_displacement"], optional
         Name of the dataset to read. Default is "displacement".
-    aws_credentials : Dict[str, Any], optional
+    aws_credentials : dict[str, Any], optional
         AWS credentials for accessing S3.
     max_concurrent : int, optional
         Maximum number of worker processes to use. Default is 4.
@@ -468,7 +430,7 @@ class DispReaderPool:
 
     def __init__(
         self,
-        filepaths: List[str | Path],
+        filepaths: list[str | Path],
         page_size: int = 4 * 1024 * 1024,
         dset_name: Literal[
             "displacement", "short_wavelength_displacement"
@@ -527,7 +489,7 @@ class DispReaderPool:
 
         Parameters
         ----------
-        aws_credentials : Dict[str, Any], optional
+        aws_credentials : dict[str, Any], optional
             AWS credentials for accessing S3. If not provided, uses the credentials
             specified during initialization.
         """
@@ -559,7 +521,9 @@ class DispReaderPool:
             self.workers.append(p)
 
         self._opened = True
-        print(f"Started {len(self.workers)} worker processes for parallel reading")
+        logger.debug(
+            f"Started {len(self.workers)} worker processes for parallel reading"
+        )
 
     def __getitem__(self, key):
         """Get a slice of data from the stack using worker processes.
@@ -624,176 +588,7 @@ class DispReaderPool:
         # Clean up
         self.workers = []
         self._opened = False
-        print("All worker processes stopped")
+        logger.debug("All worker processes stopped")
 
     def __del__(self):
         self.close()
-
-
-class DispReaderPoolPinned:
-    """
-    Example showing how to "pin" each URL to exactly one worker, which
-    opens it once and does all slice-reads for that file.
-    """
-
-    def __init__(
-        self,
-        filepaths: List[str],
-        dset_name: str = "displacement",
-        aws_credentials: Dict = None,
-        max_workers: int = 4,
-    ):
-        self.filepaths = list(filepaths)
-        self.dset_name = dset_name
-        self.aws_credentials = aws_credentials
-        self.max_workers = max_workers
-
-        # Optionally sort or parse times, build incidence matrix, etc.
-        # For brevity, omitted here.
-
-        # 1) Partition the filepaths across workers
-        # E.g. round-robin or hash or chunk them
-        # Simple round-robin approach:
-        self.worker_file_lists = [[] for _ in range(max_workers)]
-        for i, url in enumerate(self.filepaths):
-            w_id = i % max_workers
-            self.worker_file_lists[w_id].append(url)
-
-        # 2) Make a lookup: which worker ID is responsible for each URL?
-        self.url_to_worker = {}
-        for w_id, url_list in enumerate(self.worker_file_lists):
-            for url in url_list:
-                self.url_to_worker[url] = w_id
-
-        # 3) Create a request queue & result queue for each worker
-        self.task_queues = []
-        self.workers = []
-        self.result_queue = mp.Queue()
-
-    def open(self):
-        """Spin up the worker processes and open the assigned files."""
-        # Do nothing if already open
-        if self.workers:
-            return
-
-        for w_id in range(self.max_workers):
-            q = mp.Queue()
-            self.task_queues.append(q)
-
-            # The subset of URLs for this worker
-            urls_for_worker = self.worker_file_lists[w_id]
-
-            p = mp.Process(
-                target=worker_main,
-                args=(
-                    w_id,
-                    urls_for_worker,
-                    self.dset_name,
-                    self.ros3_kwargs,
-                    q,
-                    self.result_queue,
-                ),
-            )
-            p.start()
-            self.workers.append(p)
-
-        print(f"Started {len(self.workers)} workers.", file=sys.stderr)
-
-    def close(self):
-        """Shut down all workers."""
-        for q in self.task_queues:
-            q.put(None)  # sentinel
-
-        for p in self.workers:
-            p.join(timeout=3)
-            if p.is_alive():
-                p.terminate()
-
-        self.workers = []
-        self.task_queues = []
-        print("All workers closed", file=sys.stderr)
-
-    def __del__(self):
-        self.close()
-
-    def __getitem__(self, key):
-        """Get a slice of data from the stack using worker processes.
-
-        Parameters
-        ----------
-        key : tuple[slice | int]
-            Tuple of slices/indices into (time, y, x) dimensions.
-
-        Returns
-        -------
-        np.ndarray
-            Data transformed from relative to absolute displacements.
-        """
-        if not self._opened:
-            self.open()
-
-        # Extract time and spatial keys
-        if isinstance(key, tuple):
-            time_key = key[0]
-            spatial_key = key[1:]
-        else:
-            time_key = key
-            spatial_key = (slice(None), slice(None))
-
-        # Submit tasks to worker processes
-        for i, url in enumerate(self.filepaths):
-            # self.task_queue.put((i, str(url), self.dset_name, spatial_key))
-            w_id = self.url_to_worker[url]
-            self.task_queues[w_id].put((i, url, spatial_key))
-
-        # Collect results with progress tracking
-        results = [None] * len(self.filepaths)
-        for _ in tqdm(range(len(self.filepaths)), desc="Reading data"):
-            job_id, data = self.result_queue.get()
-            if isinstance(data, str):  # Error message
-                raise RuntimeError(f"Error processing file {job_id}: {data}")
-            results[job_id] = data
-
-        # Stack the results
-        data = np.stack(results)
-        cur_shape = data.shape
-
-        # Transform from relative to absolute displacements
-        return (self.incidence_pinv @ data.reshape(cur_shape[0], -1)).reshape(cur_shape)
-
-    def read_slice(self, url: str, slice_obj):
-        """
-        Enqueue a read request for `url` with the given slice object.
-        """
-        if not self.workers:
-            self.open()
-
-        w_id = self.url_to_worker[url]
-        self.task_queues[w_id].put((url, slice_obj))
-
-    def get_one_result(self):
-        """
-        Blocks until one result arrives in `result_queue`.
-        Returns (request_id, np_array_or_error).
-        """
-        return self.result_queue.get()
-
-    def read_many_slices(self, requests):
-        """
-        requests is a list of (url, slice_obj).
-        We submit them all, then gather results.
-        Return them in a dict or list.
-        """
-        # 1) Submit all
-        results_pending = {}
-        for url, slice_obj in requests:
-            req_id = self.read_slice(url, slice_obj)
-            results_pending[req_id] = (url, slice_obj)
-
-        # 2) Collect them all
-        final_results = {}
-        for _ in range(len(requests)):
-            req_id, arr_or_err = self.get_one_result()
-            final_results[req_id] = arr_or_err
-
-        return final_results
