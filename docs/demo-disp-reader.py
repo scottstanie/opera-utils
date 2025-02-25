@@ -6,11 +6,13 @@ Supports reading by row/column or lat/lon coordinates and outputs CSV time serie
 
 import json
 import time
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import pyproj
 import tyro
@@ -39,7 +41,10 @@ def read_url_list(file_path: str) -> list[str]:
 
 
 def initialize_reader(
-    urls: list[str], page_size: int = 4 * 1024 * 1024, max_workers: int = 8
+    urls: Sequence[str],
+    page_size: int = 4 * 1024 * 1024,
+    max_workers: int = 8,
+    dset_name: _disp.DispLayers = _disp.DispLayers.displacement,
 ) -> _disp.DispReader:
     """Initialize and open the displacement reader.
 
@@ -51,6 +56,8 @@ def initialize_reader(
         Page size in bytes for HDF5 file system page strategy. Default is 4MB.
     max_workers : int, optional
         Number of worker processes to use. Default is 8.
+    dset_name : {"displacement", "short_wavelength_displacement"}, optional
+        Name of the dataset to read. Default is "displacement".
 
     Returns
     -------
@@ -62,6 +69,7 @@ def initialize_reader(
         urls,
         page_size=page_size,
         max_workers=max_workers,
+        dset_name=dset_name,
         use_multiprocessing=max_workers > 1,
         aws_credentials=aws_credentials,
     )
@@ -114,8 +122,8 @@ def get_frame_transformers(
 
 
 def lonlat_to_rowcol(
-    lons: list[float],
-    lats: list[float],
+    lons: Sequence[float],
+    lats: Sequence[float],
     utm_to_lonlat: pyproj.Transformer,
     rowcol_to_utm: AffineTransformer,
 ) -> list[tuple[int, int]]:
@@ -158,8 +166,8 @@ def lonlat_to_rowcol(
 
 def get_sample_locations(
     row_col: Optional[tuple[int, int]],
-    lats: Optional[list[float]],
-    lons: Optional[list[float]],
+    lats: Optional[Sequence[float]],
+    lons: Optional[Sequence[float]],
     rowcol_to_utm: Affine,
     utm_to_lonlat: pyproj.Transformer,
 ) -> list[dict[str, Any]]:
@@ -169,9 +177,9 @@ def get_sample_locations(
     ----------
     row_col : Optional[tuple[int, int]], optional
         Single (row, column) location.
-    lats : Optional[list[float]], optional
+    lats : Optional[Sequence[float]], optional
         list of latitudes.
-    lons : Optional[list[float]], optional
+    lons : Optional[Sequence[float]], optional
         list of longitudes.
     rowcol_to_utm : Affine
         Transformer for row/col to UTM conversion.
@@ -225,8 +233,8 @@ def get_sample_locations(
 
 
 def read_time_series(
-    reader: _disp.DispReader, locations: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
+    reader: _disp.DispReader, locations: Sequence[dict[str, Any]]
+) -> list[np.ndarray]:
     """Read time series data for each location.
 
     Parameters
@@ -241,6 +249,7 @@ def read_time_series(
     list[dict[str, Any]]
         Locations with time series data added
     """
+    outputs: list[np.ndarray] = []
     for loc in locations:
         row, col = loc["row"], loc["col"]
 
@@ -251,22 +260,18 @@ def read_time_series(
         read_time = time.time() - t0
 
         # Extract the time series (squeeze removes singleton dimensions)
-        time_series = data.squeeze()
-
-        # Add time series to the location data
-        loc["time_series"] = time_series
+        outputs.append(data.squeeze())
 
         print(
             f"Location {loc['location_id']}: ({row}, {col}) - "
             f"Read shape {data.shape} in {read_time:.2f} seconds"
         )
-
-    return locations
+    return outputs
 
 
 def create_dataframes(
     locations: list[dict[str, Any]], dates: list[datetime]
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> pd.DataFrame:
     """Create wide and long format DataFrames from time series data.
 
     Parameters
@@ -303,7 +308,6 @@ def create_dataframes(
 
 def save_outputs(
     df_wide: pd.DataFrame,
-    df_long: pd.DataFrame,
     locations: list[dict[str, Any]],
     dates: list[datetime],
     output_dir: Path,
@@ -315,8 +319,6 @@ def save_outputs(
     ----------
     df_wide : pd.DataFrame
         Wide format DataFrame
-    df_long : pd.DataFrame
-        Long format DataFrame
     locations : list[dict[str, Any]]
         list of locations with metadata
     dates : list[datetime]
@@ -340,12 +342,6 @@ def save_outputs(
     df_wide.to_csv(csv_filename, index=False)
     output_files["wide_csv"] = csv_filename
     print(f"Time series data saved to {csv_filename}")
-
-    # Save long format DataFrame
-    long_csv_filename = output_dir / f"displacement_timeseries_long_{timestamp}.csv"
-    df_long.to_csv(long_csv_filename, index=False)
-    output_files["long_csv"] = long_csv_filename
-    print(f"Long-format time series data saved to {long_csv_filename}")
 
     # Create metadata file
     metadata = {
@@ -413,6 +409,7 @@ def main(
     row_col: Optional[tuple[int, int]] = None,
     lats: Optional[list[float]] = None,
     lons: Optional[list[float]] = None,
+    dset_name: _disp.DispLayers = _disp.DispLayers.displacement,
     max_workers: int = 8,
     page_size: int = 4 * 1024 * 1024,
     output_dir: Path = Path("./output"),
@@ -430,6 +427,8 @@ def main(
         list of latitudes to read from (used with `lons`).
     lons : Optional[list[float]], optional
         list of longitudes to read from (used with `lats`).
+    dset_name : {"displacement", "short_wavelength_displacement"}, optional
+        Name of the dataset to read. Default is "displacement".
     max_workers : int, optional
         Number of worker processes to use. Default is 8.
     page_size : int, optional
@@ -444,7 +443,9 @@ def main(
     urls = read_url_list(url_file)
     print(f"Found {len(urls)} URLs to process")
 
-    reader = initialize_reader(urls, page_size=page_size, max_workers=max_workers)
+    reader = initialize_reader(
+        urls, page_size=page_size, max_workers=max_workers, dset_name=dset_name
+    )
 
     rowcol_to_utm, utm_to_lonlat, frame_id = get_frame_transformers(reader)
     print(f"Procssing OPERA DISP Frame {frame_id:05d}")
@@ -460,10 +461,13 @@ def main(
     # Get unique dates (skip the first reference date where displacement = 0)
     dates = reader.unique_dates[1:]
 
-    locations = read_time_series(reader, locations)
+    time_series = read_time_series(reader, locations)
+    for loc in locations:
+        # Add time series to the location data
+        loc["time_series"] = time_series
 
-    df_wide, df_long = create_dataframes(locations, dates)
-    save_outputs(df_wide, df_long, locations, dates, output_dir, plot)
+    df_wide = create_dataframes(locations, dates)
+    save_outputs(df_wide, locations, dates, output_dir, plot)
 
     print("All processing complete!")
     # Ensure reader is closed

@@ -5,9 +5,10 @@ import multiprocessing as mp
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from itertools import chain
 from pathlib import Path
-from typing import Any, Literal, NamedTuple, Optional, TypeVar, Union
+from typing import Any, NamedTuple, Optional, TypeVar, Union
 
 import h5py
 import numpy as np
@@ -27,6 +28,26 @@ __all__ = [
 ]
 
 logger = logging.getLogger("opera_utils")
+
+# Names in the DISP-S1 product:
+# [p.name for p in DISPLACEMENT_PRODUCTS]
+# ['displacement',
+#  'short_wavelength_displacement',
+#  'recommended_mask',
+#  'connected_component_labels',
+#  'temporal_coherence',
+#  'estimated_phase_quality',
+#  'persistent_scatterer_mask',
+#  'shp_counts',
+#  'water_mask',
+#  'phase_similarity',
+#  'timeseries_inversion_residuals']
+
+
+# For use in newer pythons, if we want to type the dataset arg:
+class DispLayers(str, Enum):
+    displacement = "displacement"
+    short_wavelength_displacement = "short_wavelength_displacement"
 
 
 @dataclass
@@ -358,9 +379,9 @@ class DispReader:
         Default is 4.
     """
 
-    filepaths: list[PathOrStr]
+    filepaths: Sequence[PathOrStr]
     page_size: int = 4 * 1024 * 1024
-    dset_name: Literal["displacement", "short_wavelength_displacement"] = "displacement"
+    dset_name: DispLayers = DispLayers.displacement
     aws_credentials: Optional[Any] = None
     use_multiprocessing: bool = False
     max_workers: int = 4
@@ -437,7 +458,7 @@ class DispReader:
                     args=(
                         w_id,
                         urls_for_worker,
-                        self.dset_name,
+                        str(self.dset_name),
                         creds,
                         self.task_queues[w_id],
                         self.result_queue,
@@ -541,7 +562,7 @@ class DispReader:
 
         logger.debug(f"[Worker {worker_id}] shutting down")
 
-    def __getitem__(self, key):
+    def __getitem__(self, key) -> np.ndarray:
         """Get a slice of data from the stack.
 
         Parameters
@@ -591,7 +612,7 @@ class DispReader:
             # Read the data from each file directly
             data = []
             for ds in tqdm(self.datasets, desc="Reading data"):
-                data.append(ds[self.dset_name][spatial_key])
+                data.append(ds[str(self.dset_name)][spatial_key])
             data = np.stack(data)
 
         # Transform from relative to absolute displacements
