@@ -458,7 +458,7 @@ class DispReader:
                     args=(
                         w_id,
                         urls_for_worker,
-                        str(self.dset_name),
+                        self.dset_name.value,
                         creds,
                         self.task_queues[w_id],
                         self.result_queue,
@@ -612,7 +612,7 @@ class DispReader:
             # Read the data from each file directly
             data = []
             for ds in tqdm(self.datasets, desc="Reading data"):
-                data.append(ds[str(self.dset_name)][spatial_key])
+                data.append(ds[self.dset_name.value][spatial_key])
             data = np.stack(data)
 
         # Transform from relative to absolute displacements
