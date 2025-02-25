@@ -581,7 +581,10 @@ class DispReader:
         # Close all open handles
         for h in file_handles.values():
             if h is not None:
-                h.close()
+                try:
+                    h.close()
+                except AttributeError:
+                    h = None
 
         logger.debug(f"[Worker {worker_id}] shutting down")
 
