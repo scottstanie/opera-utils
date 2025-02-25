@@ -107,7 +107,7 @@ def get_frame_transformers(
 
     # Create transformer between UTM and lat/lon (WGS84)
     utm_to_lonlat = pyproj.Transformer.from_crs(
-        frame_metadata.crs, "EPSG:4326", always_xy=True
+        frame_metadata.crs.to_epsg(), "EPSG:4326", always_xy=True
     )
 
     return rowcol_to_utm, utm_to_lonlat, frame_id
