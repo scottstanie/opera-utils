@@ -262,7 +262,9 @@ def stitch_geometry_layers(
     return output_files
 
 
-def get_incidence_angles(static_h5file: PathOrStr, subsample_factor: int = 10):
+def get_incidence_angles(
+    static_h5file: PathOrStr, subsample_factor: int | tuple[int, int] = (10, 10)
+):
     """Calculate incidence angles from Line Of Sight (LOS) east and north components.
 
     This function reads the LOS east and north components from the HDF5 file,
@@ -282,11 +284,16 @@ def get_incidence_angles(static_h5file: PathOrStr, subsample_factor: int = 10):
         Array of incidence angles in degrees.
 
     """
+    if isinstance(subsample_factor, int):
+        row_sub = col_sub = subsample_factor
+    else:
+        row_sub, col_sub = subsample_factor
+
     with h5py.File(static_h5file) as hf:
         ds_east = hf[f"data/{Layer.LOS_EAST.value}"]
         ds_north = hf[f"data/{Layer.LOS_NORTH.value}"]
-        los_east = ds_east[::subsample_factor, ::subsample_factor]
-        los_north = ds_north[::subsample_factor, ::subsample_factor]
+        los_east = ds_east[::row_sub, ::col_sub]
+        los_north = ds_north[::row_sub, ::col_sub]
 
         inc_angle_rad = np.arccos(np.sqrt(1 - los_east**2 - los_north**2))
         return np.degrees(inc_angle_rad)
