@@ -212,7 +212,7 @@ def get_sample_locations(
             lons, lats, utm_to_lonlat, frame_affine_transformer
         )
     else:
-        raise ValueError("Either --rows, --cols or --lats and --lons must be provided")
+        raise ValueError("Either rows and cols, or lats and lons, must be provided")
 
     # Process each location
     for i, (row, col) in enumerate(base_locations):
