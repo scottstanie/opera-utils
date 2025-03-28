@@ -1,6 +1,5 @@
 import netrc
 import os
-from datetime import datetime
 
 import aiohttp
 import boto3.s3
@@ -9,46 +8,13 @@ import fsspec
 import h5py
 import requests
 import s3fs
-from pydantic import BaseModel, Field
 
-ENDPOINTS = {
-    # ESA's SAFE granules via ASF:
-    "sentinel1": "https://sentinel1.asf.alaska.edu/s3credentials",
-    # OPERA products via ASF
-    "opera": "https://cumulus.asf.alaska.edu/s3credentials",
-    # Test OPERA products (the UAT venue, uat.urs.earthdata.nasa.gov)
-    "opera-uat": "https://cumulus-test.asf.alaska.edu/s3credentials",
-}
+from .credentials import ENDPOINTS, AWSCredentials
 
 
-class AWSCredentials(BaseModel):
-    """Class for AWS credentials (accessKeyId, secretAccessKey, sessionToken)."""
-
-    access_key_id: str = Field(alias="accessKeyId")
-    secret_access_key: str = Field(alias="secretAccessKey")
-    session_token: str = Field(alias="sessionToken")
-    expiration: datetime | None = None
-
-    def to_session(self) -> boto3.Session:
-        return boto3.Session(
-            aws_access_key_id=self.access_key_id,
-            aws_secret_access_key=self.secret_access_key,
-            aws_session_token=self.session_token,
-            region_name="us-west-2",
-        )
-
-    def to_env(self) -> dict[str, str]:
-        """Return the environment variable format of values: `AWS_`.
-
-        Settable using os.environ.
-        """
-        return {
-            "AWS_ACCESS_KEY_ID": self.access_key_id,
-            "AWS_SECRET_ACCESS_KEY": self.secret_access_key,
-            "AWS_SESSION_TOKEN": self.session_token,
-        }
-
-
+# For instance, 50 minutes so that credentials are refreshed at least 10 minutes
+# before they're set to expire.
+@cachetools.func.ttl_cache(ttl=60 * 50)
 def get_earthaccess_s3_creds(dataset: str = "opera") -> AWSCredentials:
     """Get S3 credentials for the specified dataset.
 
@@ -87,6 +53,7 @@ def get_earthaccess_s3_creds(dataset: str = "opera") -> AWSCredentials:
     return AWSCredentials(**auth.get_s3_credentials(endpoint=ENDPOINTS[dataset]))
 
 
+@cachetools.func.ttl_cache(ttl=60 * 50)
 def get_authorized_s3_client(
     dataset: str = "opera",
     aws_credentials: AWSCredentials | None = None,
@@ -186,8 +153,6 @@ def print_export(dataset: str = "opera") -> None:
 
 
 # Set TTL to number of seconds to cache.
-# For instance, 50 minutes so that credentials are refreshed at least 10 minutes
-# before they're set to expire.
 @cachetools.func.ttl_cache(ttl=60 * 50)
 def get_temporary_aws_credentials() -> dict:
     """Get temporary AWS S3 access credentials.
