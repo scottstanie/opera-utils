@@ -3,11 +3,11 @@ from pathlib import Path
 
 import pytest
 
-from opera_utils._disp import (
+from opera_utils.disp._reader import (
     OperaDispFile,
-    _get_first_file_per_ministack,
     parse_disp_datetimes,
 )
+from opera_utils.disp._utils import _last_per_ministack
 
 
 @pytest.fixture
@@ -61,7 +61,7 @@ def test_parse_disp_datetimes(sample_files):
 
 
 def test_get_first_file_per_ministack(sample_files):
-    result = _get_first_file_per_ministack(sample_files)
+    result = _last_per_ministack(sample_files)
 
     assert len(result) == 1
     assert result[0] == sample_files[0]

@@ -18,7 +18,7 @@ import pyproj
 import tyro
 from rasterio.transform import Affine, AffineTransformer
 
-from opera_utils import _disp
+from opera_utils.disp import _reader
 from opera_utils.credentials import get_earthaccess_s3_creds
 
 
@@ -44,8 +44,8 @@ def initialize_reader(
     urls: Sequence[str],
     page_size: int = 4 * 1024 * 1024,
     max_workers: int = 8,
-    dset_name: _disp.DispLayers = _disp.DispLayers.displacement,
-) -> _disp.DispReader:
+    dset_name: _reader.DispLayers = _reader.DispLayers.displacement,
+) -> _reader.DispReader:
     """Initialize and open the displacement reader.
 
     Parameters
@@ -65,7 +65,7 @@ def initialize_reader(
         Initialized reader object
     """
     aws_credentials = get_earthaccess_s3_creds("opera-uat")
-    reader = _disp.DispReader(
+    reader = _reader.DispReader(
         urls,
         page_size=page_size,
         max_workers=max_workers,
@@ -80,7 +80,7 @@ def initialize_reader(
 
 
 def get_frame_transformers(
-    reader: _disp.DispReader,
+    reader: _reader.DispReader,
 ) -> tuple[AffineTransformer, pyproj.Transformer, int]:
     """Get transformers for coordinate conversions.
 
@@ -107,7 +107,7 @@ def get_frame_transformers(
     if len(set(df.frame_id for df in reader.disp_files)) > 1:
         raise ValueError("More than one frame found in reader")
 
-    frame_metadata = _disp.FrameMetadata.from_frame_id(frame_id)
+    frame_metadata = _reader.FrameMetadata.from_frame_id(frame_id)
 
     # Set up the transformer from row/col to UTM and lat/lon
     transform = Affine.from_gdal(*frame_metadata.geotransform)
@@ -234,7 +234,7 @@ def get_sample_locations(
 
 
 def read_time_series(
-    reader: _disp.DispReader, locations: Sequence[dict[str, Any]]
+    reader: _reader.DispReader, locations: Sequence[dict[str, Any]]
 ) -> list[np.ndarray]:
     """Read time series data for each location.
 
@@ -411,7 +411,7 @@ def main(
     cols: Optional[Sequence[int]] = None,
     lats: Optional[list[float]] = None,
     lons: Optional[list[float]] = None,
-    dset_name: _disp.DispLayers = _disp.DispLayers.displacement,
+    dset_name: _reader.DispLayers = _reader.DispLayers.displacement,
     max_workers: int = 8,
     page_size: int = 4 * 1024 * 1024,
     output_dir: Path = Path("./output"),
