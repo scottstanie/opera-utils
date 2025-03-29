@@ -1,7 +1,8 @@
 import logging
 from collections import defaultdict
 from datetime import datetime
-from typing import Annotated, Any
+from pathlib import Path
+from typing import Annotated, Any, Literal
 
 import requests
 import tyro
@@ -20,8 +21,10 @@ class Granule(BaseModel):
     ----------
     frame_id : str | None
         The frame number of the granule.
-    ascending_descending : str | None
-        The direction (ASCENDING or DESCENDING).
+    url : str
+        URL (https or s3) containing granule download location.
+    ascending_descending : str
+        The direction (ascending or descending).
     start : datetime
         The beginning date/time of the granule.
     end : datetime
@@ -29,12 +32,17 @@ class Granule(BaseModel):
     """
 
     frame_id: int
+    url: str
     ascending_descending: Annotated[str, StringConstraints(to_lower=True)]
     start: datetime
     end: datetime
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "Granule":
+    def from_umm(
+        cls,
+        umm_data: dict[str, Any],
+        url_type: Literal["s3", "https"] = "https",
+    ) -> "Granule":
         """
         Construct a Granule instance from a raw dictionary.
 
@@ -53,21 +61,55 @@ class Granule(BaseModel):
         ValueError
             If required temporal extent data is missing.
         """
-        umm = data.get("umm", {})
-        additional_attributes = umm.get("AdditionalAttributes", [])
+        url = get_download_url(umm_data, protocol=url_type)
+        additional_attributes = umm_data.get("AdditionalAttributes", [])
         frame = _get_attr(additional_attributes, "FRAME_NUMBER")
         direction = _get_attr(additional_attributes, "ASCENDING_DESCENDING")
-        temporal_extent = umm.get("TemporalExtent", {}).get("RangeDateTime", {})
+        temporal_extent = umm_data.get("TemporalExtent", {}).get("RangeDateTime", {})
         begin_str = temporal_extent.get("BeginningDateTime")
         end_str = temporal_extent.get("EndingDateTime")
         if begin_str is None or end_str is None:
             raise ValueError("Missing temporal extent data")
         return cls(
             frame_id=frame,
+            url=url,
             ascending_descending=direction,
             start=begin_str,
             end=end_str,
         )
+
+
+def get_download_url(
+    umm_data: dict[str, Any],
+    protocol: Literal["s3", "https"] = "https",
+) -> str:
+    """Extract a download URL from the product's UMM metadata.
+
+    Parameters
+    ----------
+    product : dict[str, Any]
+        The product's umm metadata dictionary
+    protocol : Literal["s3", "https"]
+        The protocol to use for downloading, either "s3" or "https"
+
+    Returns
+    -------
+    str
+        The download URL
+
+    Raises
+    ------
+    ValueError
+        If no URL with the specified protocol is found or if the protocol is invalid
+    """
+    if protocol not in ["https", "s3"]:
+        raise ValueError(f"Unknown protocol {protocol}; must be https or s3")
+
+    for url in umm_data["RelatedUrls"]:
+        if url["Type"].startswith("GET DATA") and url["URL"].startswith(protocol):
+            return url["URL"]
+
+    raise ValueError(f"No download URL found for granule {product['umm']['GranuleUR']}")
 
 
 def _get_attr(attrs: list[dict[str, Any]], name: str) -> str | None:
@@ -133,7 +175,7 @@ def fetch_granules() -> list[Granule]:
     granules: list[Granule] = []
     for item in granules_raw:
         try:
-            granule = Granule.from_dict(item)
+            granule = Granule.from_umm(item["umm"])
             granules.append(granule)
         except Exception as e:
             logging.warning(f"Skipping granule due to error: {e}")
@@ -177,7 +219,9 @@ def aggregate_frames(granules: list[Granule]) -> list[FrameGranuleData]:
     return aggregated_data
 
 
-def main(print_output: bool = True) -> list[FrameGranuleData]:
+def main(
+    save_to: Path | None = None, print_output: bool = True
+) -> tuple[list[Granule], list[FrameGranuleData]]:
     """Fetch and aggregate DISP-S1 granule metadata from CMR.
 
     Parameters
@@ -211,7 +255,7 @@ def main(print_output: bool = True) -> list[FrameGranuleData]:
             )
         console.print(table)
 
-    return aggregated
+    return granules, aggregated
 
 
 if __name__ == "__main__":
