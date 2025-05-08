@@ -106,6 +106,14 @@ NODATA_VALUES = {
 }
 
 
+class OutputFormat(str, Enum):
+    gtiff = "gtiff"
+    netcdf = "netcdf"
+
+    def __str__(self) -> str:
+        return self.value
+
+
 def rebase(
     output_dir: Path | str,
     nc_files: Sequence[Path | str],
@@ -114,6 +122,7 @@ def rebase(
     apply_solid_earth_corrections: bool = True,
     apply_ionospheric_corrections: bool = True,
     nan_policy: str | NaNPolicy = NaNPolicy.propagate,
+    output_format: str | OutputFormat = OutputFormat.gtiff,
     reference_point: tuple[int, int] | None = None,
     keep_bits: int = 9,
     make_overviews: bool = True,
@@ -145,6 +154,11 @@ def rebase(
         product, with nan at a pixel causes all subsequent data to be nan.
         If "omit", then any nan causes the pixel to be zeroed out, which is
         equivalent to assuming that 0 displacement occurred during that time.
+    output_format: str | OutputFormat
+        Format of output data to create.
+        "gtiff" creates one separate 2D GeoTIFF file for each secondary date.
+        "netcdf" creates one "Virtual HDF5 Dataset"
+        Default is gtiff.
     reference_point : tuple[int, int] | None
         The (row, column) of the reference point to use when rebasing /displacement.
         If None, finds a point with the highest harmonic mean of temporal coherence.
@@ -161,48 +175,18 @@ def rebase(
     """
     nc_files = sorted(nc_files)
     product_stack = DispProductStack.from_file_list(nc_files)
-    # Flatten all dates, find unique sorted list of SAR epochs
-    all_dates = sorted(set(flatten(product_stack.ifg_date_pairs)))
 
-    # Create the main displacement dataset.
-    writer = GeotiffStackWriter.from_dates(
-        Path(output_dir),
+    reader, mask_reader, corrections_readers, writer = _make_readers_writer(
+        nc_files=nc_files,
+        output_dir=output_dir,
         dataset=dataset,
-        date_list=all_dates,
-        keep_bits=keep_bits,
-        profile=product_stack.get_rasterio_profile(),
+        mask_dataset=mask_dataset,
+        apply_ionospheric_corrections=apply_ionospheric_corrections,
+        apply_solid_earth_corrections=apply_solid_earth_corrections,
     )
+
     if all(Path(f).exists() for f in writer.files):
         return
-
-    reader = HDF5StackReader(nc_files, dset_name=dataset, nodata=np.nan)
-    corrections_readers = []
-    if apply_solid_earth_corrections:
-        corrections_readers.append(
-            HDF5StackReader(
-                nc_files,
-                dset_name=str(CorrectionDataset.SOLID_EARTH_TIDE),
-                nodata=np.nan,
-            )
-        )
-    if apply_ionospheric_corrections:
-        corrections_readers.append(
-            HDF5StackReader(
-                nc_files,
-                dset_name=str(CorrectionDataset.IONOSPHERIC_DELAY),
-                nodata=np.nan,
-            )
-        )
-    mask_reader = (
-        HDF5StackReader(
-            nc_files,
-            dset_name=str(mask_dataset),
-            nodata=255,
-        )
-        if mask_dataset is not None
-        else None
-    )
-
     # Make a "cumulative offset" which adds up the phase each time theres a reference
     # date changeover.
     shape = product_stack[0].shape
@@ -250,6 +234,54 @@ def rebase(
         writer.make_overviews()
 
 
+def _make_readers_writer(
+    nc_files: Sequence[Path],
+    output_dir: Path,
+    dataset: str,
+    mask_dataset: QualityDataset | None = QualityDataset.RECOMMENDED_MASK,
+    apply_solid_earth_corrections: bool = True,
+    apply_ionospheric_corrections: bool = True,
+):
+    product_stack = DispProductStack.from_file_list(nc_files)
+    # Flatten all dates, find unique sorted list of SAR epochs
+    all_dates = sorted(set(flatten(product_stack.ifg_date_pairs)))
+    writer = GeotiffStackWriter.from_dates(
+        Path(output_dir),
+        dataset=dataset,
+        date_list=all_dates,
+        profile=product_stack.get_rasterio_profile(),
+    )
+
+    reader = HDF5StackReader(nc_files, dset_name=dataset, nodata=np.nan)
+    corrections_readers = []
+    if apply_solid_earth_corrections:
+        corrections_readers.append(
+            HDF5StackReader(
+                nc_files,
+                dset_name=str(CorrectionDataset.SOLID_EARTH_TIDE),
+                nodata=np.nan,
+            )
+        )
+    if apply_ionospheric_corrections:
+        corrections_readers.append(
+            HDF5StackReader(
+                nc_files,
+                dset_name=str(CorrectionDataset.IONOSPHERIC_DELAY),
+                nodata=np.nan,
+            )
+        )
+    mask_reader = (
+        HDF5StackReader(
+            nc_files,
+            dset_name=str(mask_dataset),
+            nodata=255,
+        )
+        if mask_dataset is not None
+        else None
+    )
+    return reader, mask_reader, corrections_readers, writer
+
+
 @dataclass
 class HDF5StackReader:
     """Reader for HDF5 datasets from multiple files."""
@@ -294,11 +326,15 @@ class GeotiffStackWriter:
             self.profile["dtype"] = np.dtype(self.dtype)
         if self.nodata is not None:
             self.profile["nodata"] = self.nodata
+        self._do_round = self.keep_bits is not None and np.issubdtype(
+            np.dtype(self.dtype), np.floating
+        )
 
     def __setitem__(self, key, value):
         # Check if we have a floating point raster
-        if self.keep_bits is not None and np.issubdtype(value.dtype, np.floating):
+        if self._do_round:
             round_mantissa(value, keep_bits=self.keep_bits)
+            self.profile["nbits"] = "16"
 
         if isinstance(key, slice):
             keys = list(range(key.start, key.stop, key.step))
