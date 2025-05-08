@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import multiprocessing as mp
+from collections.abc import Sequence
 from enum import Enum
 from functools import partial
 
@@ -29,7 +30,7 @@ def read_lonlat(
     product: DispProduct,
     lon_slice: slice | float,
     lat_slice: slice | float,
-    dset: str = "displacement",
+    dset: str | Sequence[str] = "displacement",
 ) -> np.ndarray:
     """Read data from a single product for a longitude/latitude box.
 
@@ -51,10 +52,15 @@ def read_lonlat(
     """
     rows, cols = _get_rows_cols(lon_slice, lat_slice, product)
 
+    dset_list = [dset] if isinstance(dset, str) else list(dset)
+
     # Read the data
+    out = []
     with open_h5(product) as hf:
-        dset_obj = hf[dset]
-        return dset_obj[rows, cols]
+        for dset in dset_list:
+            dset_obj = hf[dset]
+            out.append(dset_obj[rows, cols])
+    return out
 
 
 def read_stack_lonlat(
@@ -65,7 +71,7 @@ def read_stack_lonlat(
     ref_lon: float | None = None,
     ref_lat: float | None = None,
     max_workers: int | None = None,
-    dset: str = "displacement",
+    dset: str | Sequence[str] = "displacement",
 ) -> tuple[np.ndarray, dict[str, str | float]]:
     """Process a stack using the lon/lat box method with optional multiprocessing.
 
@@ -121,7 +127,7 @@ def read_stack_lonlat(
     # Create a process pool, using spawn to avoid problems with h5py
     ctx = mp.get_context("spawn")
     with ctx.Pool(processes=max_workers) as pool:
-        results = list(
+        result_lists = list(
             tqdm(
                 pool.imap(read_func, stack.products),
                 total=len(stack.products),
@@ -145,8 +151,10 @@ def read_stack_lonlat(
         attrs["reference_lat"] = ref_lat or "None"
 
     # Stack the results and adjust reference (if needed)
+    # TODO: unzip the result_list
     unreffed_data = np.stack(results)
     if "displacement" not in dset:
+        # TODO: no attrs???
         return unreffed_data
 
     # Only the displacement/short_wavelength_displacement needs extra work
