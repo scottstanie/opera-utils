@@ -221,7 +221,18 @@ def _get_zarr_encoding(
     }
     if not data_vars:
         data_vars = list(ds.data_vars)
-    encoding = {var: encoding_per_var for var in data_vars if ds[var].ndim >= 2}
+    encoding = {}
+    for var, d in ds.data_vars.items():
+        if d.ndim == 3:
+            encoding[var] = encoding_per_var | {
+                # TODO: how do I decide what size shard I want?
+                # Do i need to limit to keep divisibility?
+                "shards": (chunks[0] * 3, chunks[1], chunks[2])
+            }
+        elif d.ndim == 2:
+            encoding[var] = encoding_per_var
+    # encoding = {var: encoding_per_var for var in data_vars if ds[var].ndim >= 2}
+    # Make shards the same x/y size, but allow different time sizes
     if not add_coords:
         return encoding
     # Handle coordinate compression
