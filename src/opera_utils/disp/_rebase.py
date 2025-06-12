@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from datetime import datetime
 from enum import Enum
 
 import numpy as np
+import pandas as pd
+import xarray as xr
+
+logger = logging.getLogger("opera_utils")
+
+__all__ = ["rebase", "rebase_np"]
 
 
 class NaNPolicy(str, Enum):
@@ -17,7 +24,7 @@ class NaNPolicy(str, Enum):
         return self.value
 
 
-def rebase_timeseries(
+def rebase_np(
     raw_data: np.ndarray,
     reference_dates: Sequence[datetime],
     nan_policy: str | NaNPolicy = NaNPolicy.propagate,
@@ -89,3 +96,65 @@ def rebase_timeseries(
         out_layer[:] = current_displacement + cumulative_offset
 
     return output
+
+
+def rebase(
+    da_displacement: xr.DataArray,
+    reference_time: Sequence[datetime | pd.DatetimeIndex] | xr.DataArray,
+    nan_policy: str | NaNPolicy = NaNPolicy.propagate,
+) -> xr.DataArray:
+    """Rebase displacement products with different reference dates.
+
+    This function combines displacement products that may have different reference
+    dates by accumulating displacements when the reference date changes.
+    When a new reference date is encountered, the displacement values from the
+    previous stack's final epoch are added to all epochs in the new stack.
+
+    Parameters
+    ----------
+    da_displacement : xr.DataArray
+        Displacement dataarray to rebase.
+    reference_time : Sequence[datetime | pd.DatetimeIndex]
+        Reference datetime for each epoch.
+        Must be same length as `da_time`.
+    nan_policy : str | NaNPolicy
+        Policy for handling NaN values in rebase_timeseries.
+        choices = ["propagate", "omit"]
+
+    Returns
+    -------
+    xr.DataArray
+        Stacked displacement dataarray with rebased displacements.
+
+    """
+    da_time = da_displacement.time  # .compute()
+    nan_policy = NaNPolicy(nan_policy)
+
+    # Find the last epoch of every ministack, where the reference date changes.
+    # These frames contain the offsets that must be accumulated.
+    ref_dates = np.unique(da_time)
+    # Short-circuit — nothing to rebase
+    if len(ref_dates) == 1:
+        return da_displacement
+    last_idxs = np.where(da_time.isin(ref_dates))[0]
+
+    # Take just those “crossover” frames,
+    crossover = da_displacement.isel(time=last_idxs)
+    # decide what to do with NaNs in them.
+    if nan_policy is NaNPolicy.omit:
+        crossover = crossover.fillna(0)
+
+    # Cumulative sum of the crossover frames gives the running offset to apply
+    ref_offsets = crossover.cumsum(dim="time")  # same length as ref_dates
+
+    for idx, ref in enumerate(ref_dates[1:]):
+        # Boolean mask that selects *all* epochs belonging to this ministack
+        # mask = (reference_time == ref).compute()
+        mask = reference_time == ref
+
+        # Add the cumulative offset on pixels where `mask` is True
+        da_displacement = xr.where(
+            mask, da_displacement + ref_offsets.isel(time=idx), da_displacement
+        )
+
+    return da_displacement.transpose("time", "y", "x")

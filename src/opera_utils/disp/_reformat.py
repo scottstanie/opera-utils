@@ -8,7 +8,6 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import tyro
 import xarray as xr
 from zarr.codecs import BloscCodec
@@ -23,6 +22,7 @@ from ._enums import (
     QualityDataset,
 )
 from ._netcdf import create_virtual_stack
+from ._rebase import NaNPolicy, rebase
 from ._utils import _ensure_chunks, round_mantissa
 
 
@@ -111,7 +111,7 @@ def reformat_stack(
     # Set default chunks if none provided
     out_chunk_dict = dict(zip(["time", "y", "x"], out_chunks))
     dps = disp.DispProductStack.from_file_list(input_files)
-    df = dps.to_dataframe()
+    dps.to_dataframe()
 
     # #####################
     # Write minimal dataset
@@ -138,10 +138,12 @@ def reformat_stack(
     # Configure compression encoding
     if out_format == "zarr":
         encoding = _get_zarr_encoding(ds_minimal, out_chunks, add_coords=True)
-        ds_minimal.to_zarr(output_name, encoding=encoding, mode="w")
+        ds_minimal.chunk(out_chunk_dict).to_zarr(
+            output_name, encoding=encoding, mode="w"
+        )
     else:
         encoding = _get_netcdf_encoding(ds_minimal, out_chunks)
-        ds_minimal.to_netcdf(
+        ds_minimal.chunk(out_chunk_dict).to_netcdf(
             output_name, engine="h5netcdf", encoding=encoding, mode="w"
         )
     print(f"Wrote minimal dataset: {time.time() - start_time:.1f}s")
@@ -162,7 +164,6 @@ def reformat_stack(
         ds_corrections = None
     _write_rebased_stack(
         ds,
-        df,
         output_name,
         out_chunks,
         data_var=DisplacementDataset.DISPLACEMENT,
@@ -177,7 +178,6 @@ def reformat_stack(
     if str(DisplacementDataset.SHORT_WAVELENGTH) in ds.data_vars:
         _write_rebased_stack(
             ds,
-            df,
             output_name,
             out_chunks,
             data_var=DisplacementDataset.SHORT_WAVELENGTH,
@@ -190,7 +190,6 @@ def reformat_stack(
     # #########################
     # Write remaining variables
     # #########################
-    # TODO: we could just read once per ministack, then tile, then write
     ds_remaining = ds[UNIQUE_PER_DATE_DATASETS + SAME_PER_MINISTACK_DATASETS].chunk(
         {
             "time": out_chunk_dict["time"],
@@ -222,7 +221,6 @@ def reformat_stack(
 
 def _write_rebased_stack(
     ds: xr.Dataset,
-    df: pd.DataFrame,
     output_name: Path | str,
     out_chunks: tuple[int, int, int],
     data_var: DisplacementDataset = DisplacementDataset.DISPLACEMENT,
@@ -232,15 +230,20 @@ def _write_rebased_stack(
     quality_threshold: float = 0.5,
     do_round: bool = True,
     process_chunk_size: tuple[int, int] = (2048, 2048),
+    nan_policy: str | NaNPolicy = NaNPolicy.propagate,
 ) -> None:
     da_displacement = ds[str(data_var)]
-
     # For this, we want to work on the entire time stack at once
     # Otherwise the summation in `create_rebased_displacement` won't work
     process_chunks = {
         "time": -1,
         "y": process_chunk_size[0],
         "x": process_chunk_size[1],
+    }
+    out_chunk_dict = {
+        "time": out_chunks[0],
+        "y": out_chunks[1],
+        "x": out_chunks[2],
     }
     process_chunks = _ensure_chunks(process_chunks, da_displacement.shape)
     if ds_corrections:
@@ -254,22 +257,24 @@ def _write_rebased_stack(
         quality_da = ds[quality_dataset].chunk(process_chunks)
         da_displacement = da_displacement.where(quality_da > quality_threshold)
 
-    da_disp = disp.create_rebased_displacement(
-        da_displacement,
-        # Need to strip timezone to match the ds.time coordinates
-        reference_datetimes=df.reference_datetime.dt.tz_localize(None),
-        process_chunk_size=process_chunk_size,
+    da_disp = rebase(
+        da_displacement=da_displacement,
+        reference_time=ds.reference_time.compute(),
+        nan_policy=nan_policy,
     )
     da_disp = da_disp.assign_coords(spatial_ref=ds.spatial_ref)
     if do_round and np.issubdtype(da_disp.dtype, np.floating):
         da_disp.data = round_mantissa(da_disp.data, keep_bits=10)
+
     ds_disp = da_disp.to_dataset(name=str(data_var))
     if out_format == "zarr":
         encoding = _get_zarr_encoding(ds_disp, out_chunks)
-        ds_disp.to_zarr(output_name, encoding=encoding, mode="a")
+        ds_disp.chunk(out_chunk_dict).to_zarr(output_name, encoding=encoding, mode="a")
     else:
         encoding = _get_netcdf_encoding(ds_disp, out_chunks)
-        ds_disp.to_netcdf(output_name, engine="h5netcdf", encoding=encoding, mode="a")
+        ds_disp.chunk(out_chunk_dict).to_netcdf(
+            output_name, engine="h5netcdf", encoding=encoding, mode="a"
+        )
 
 
 def _get_netcdf_encoding(
@@ -295,11 +300,14 @@ def _get_netcdf_encoding(
 def _get_zarr_encoding(
     ds: xr.Dataset,
     chunks: tuple[int, int, int],
+    shard_factors: tuple[int, int, int] = (1, 4, 4),
     add_coords: bool = False,
     compression_name: str = "zstd",
     compression_level: int = 6,
     data_vars: Sequence[str] = [],
 ) -> dict[str, dict]:
+    shards = tuple(int(c * f) for c, f in zip(chunks, shard_factors))
+
     encoding_per_var = {
         "compressors": [
             BloscCodec(
@@ -308,10 +316,18 @@ def _get_zarr_encoding(
             )
         ],
         "chunks": chunks,
+        "shards": shards,
     }
     if not data_vars:
         data_vars = list(ds.data_vars)
-    encoding = {var: encoding_per_var for var in data_vars if ds[var].ndim >= 2}
+    encoding = {}
+    for var in data_vars:
+        if ds[var].ndim < 2:
+            continue
+        encoding[var] = encoding_per_var
+        if ds[var].ndim == 2:
+            encoding[var]["chunks"] = chunks[-2:]
+            encoding[var]["shards"] = shards[-2:]
     if not add_coords:
         return encoding
     # Handle coordinate compression
