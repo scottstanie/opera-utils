@@ -2,6 +2,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import rasterio as rio
 import xarray as xr
 
 from opera_utils.disp import reformat_stack
@@ -65,6 +66,75 @@ class TestReformatStack:
             assert ds_name in ds_stack_netcdf.data_vars
 
         assert ds_stack_netcdf.displacement.units == "meters"
+
+    @pytest.fixture(scope="class")
+    def geotiff_stack_dir(self, tmp_path_factory):
+        input_files = list(INPUT_DISP_S1_DIR.glob("*.nc"))
+        output_dir = tmp_path_factory.mktemp("geotiff_test")
+
+        reformat_stack(input_files=input_files, output_name=output_dir)
+
+        return output_dir
+
+    @pytest.mark.skipif(
+        SKIP_TESTS, reason=f"No DISP-S1 input files found in {INPUT_DISP_S1_DIR}"
+    )
+    def test_reformat_stack_geotiff(self, geotiff_stack_dir):
+        """Test GeoTIFF output format."""
+        # Check that water mask was created
+        water_mask_path = geotiff_stack_dir / "water_mask.tif"
+        assert water_mask_path.exists()
+
+        # Check that spatial reference metadata was created
+        spatial_ref_path = geotiff_stack_dir / "spatial_ref.json"
+        assert spatial_ref_path.exists()
+
+        # Check that displacement files were created
+        displacement_files = list(geotiff_stack_dir.glob("displacement_*.tif"))
+        assert len(displacement_files) > 0
+
+        # Check that each displacement file is a valid GeoTIFF
+        for disp_file in displacement_files[:3]:  # Test first 3 files
+            with rio.open(disp_file) as src:
+                assert src.crs is not None
+                assert src.transform is not None
+                assert src.count == 1
+                assert src.units == ("meters",)
+                # Check that data is not all NaN
+                data = src.read(1)
+                assert not np.all(np.isnan(data))
+
+        # Check that quality files were created
+        quality_files = list(geotiff_stack_dir.glob("*coherence*.tif"))
+        assert len(quality_files) > 0
+
+    @pytest.mark.skipif(
+        SKIP_TESTS, reason=f"No DISP-S1 input files found in {INPUT_DISP_S1_DIR}"
+    )
+    def test_compare_geotiff_zarr(self, ds_stack_zarr, geotiff_stack_dir):
+        """Compare GeoTIFF output with Zarr output for consistency."""
+        # Load a displacement GeoTIFF file
+        displacement_files = sorted(geotiff_stack_dir.glob("displacement_*.tif"))
+
+        # Compare first few displacement files
+        for i, geotiff_file in enumerate(displacement_files[:3]):
+            with rio.open(geotiff_file) as src:
+                geotiff_data = src.read(1)
+
+            # Get corresponding data from zarr
+            zarr_data = ds_stack_zarr.displacement.isel(
+                time=i + 1
+            ).values  # Skip reference time
+
+            # Compare data (allowing for small numerical differences due to rounding)
+            valid_mask = ~np.isnan(geotiff_data) & ~np.isnan(zarr_data)
+            if np.any(valid_mask):
+                np.testing.assert_allclose(
+                    geotiff_data[valid_mask],
+                    zarr_data[valid_mask],
+                    rtol=1e-4,
+                    atol=1e-6,
+                )
 
     @pytest.mark.skipif(
         SKIP_TESTS, reason=f"No DISP-S1 input files found in {INPUT_DISP_S1_DIR}"

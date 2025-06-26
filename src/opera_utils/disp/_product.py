@@ -211,6 +211,10 @@ class DispProduct:
         product.size_in_bytes = size_in_bytes
         return product
 
+    # Add comparisons for sorting purposes:
+    def __lt__(self, other: Self) -> bool:
+        return Path(self.filename).stem < Path(other.filename).stem
+
 
 @dataclass
 class DispProductStack:

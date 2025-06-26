@@ -5,15 +5,19 @@
 # ///
 from __future__ import annotations
 
+import json
 import logging
 import time
 import warnings
+from abc import abstractmethod
 from collections.abc import Callable, Sequence
 from functools import reduce
 from pathlib import Path
+from typing import Protocol
 
 import numpy as np
 import pandas as pd
+import rasterio as rio
 import tyro
 import xarray as xr
 from affine import Affine
@@ -42,9 +46,212 @@ from ._utils import _ensure_chunks, round_mantissa
 logger = logging.getLogger("opera_utils")
 
 
+class StackWriter(Protocol):
+    """Protocol for different output format writers."""
+
+    @abstractmethod
+    def write_minimal_dataset(self, ds: xr.Dataset) -> None:
+        """Write minimal dataset (coordinates, water mask, etc.)."""
+        ...
+
+    @abstractmethod
+    def write_remaining_variables(self, ds: xr.Dataset) -> None:
+        """Write remaining variables (quality datasets, etc.)."""
+        ...
+
+    @abstractmethod
+    def write_displacement_data(self, da: xr.DataArray, data_var: str) -> None:
+        """Write displacement data array."""
+        ...
+
+
+class NetCDFStackWriter:
+    """Writer for NetCDF format."""
+
+    def __init__(self, output_name: str | Path, out_chunks: tuple[int, int, int]):
+        self.output_name = str(output_name)
+        self.out_chunks = out_chunks
+
+    def write_minimal_dataset(self, ds: xr.Dataset) -> None:
+        encoding = _get_netcdf_encoding(ds, self.out_chunks)
+        ds.to_netcdf(self.output_name, engine="h5netcdf", encoding=encoding, mode="w")
+
+    def write_remaining_variables(self, ds: xr.Dataset) -> None:
+        encoding = _get_netcdf_encoding(ds, self.out_chunks)
+        ds.to_netcdf(self.output_name, engine="h5netcdf", encoding=encoding, mode="a")
+
+    def write_displacement_data(self, da: xr.DataArray, data_var: str) -> None:
+        ds = da.to_dataset(name=data_var)
+        encoding = _get_netcdf_encoding(ds, self.out_chunks)
+        ds.to_netcdf(self.output_name, engine="h5netcdf", encoding=encoding, mode="a")
+
+
+class ZarrStackWriter:
+    """Writer for Zarr format."""
+
+    def __init__(
+        self,
+        output_name: str | Path,
+        out_chunks: tuple[int, int, int],
+        shard_factors: tuple[int, int, int],
+    ):
+        self.output_name = str(output_name)
+        self.out_chunks = out_chunks
+        self.shard_factors = shard_factors
+        self.out_shard_dict = _to_shard_dict(out_chunks, shard_factors)
+
+    def write_minimal_dataset(self, ds: xr.Dataset) -> None:
+        encoding = _get_zarr_encoding(ds, self.out_chunks, add_coords=True)
+        ds.chunk(self.out_shard_dict).to_zarr(
+            self.output_name, encoding=encoding, mode="w", consolidated=False
+        )
+
+    def write_remaining_variables(self, ds: xr.Dataset) -> None:
+        encoding = _get_zarr_encoding(ds, self.out_chunks)
+        ds.to_zarr(self.output_name, encoding=encoding, mode="a", consolidated=False)
+
+    def write_displacement_data(self, da: xr.DataArray, data_var: str) -> None:
+        ds = da.to_dataset(name=data_var)
+        encoding = _get_zarr_encoding(
+            ds, self.out_chunks, shard_factors=self.shard_factors
+        )
+        ds.chunk(self.out_shard_dict).to_zarr(
+            self.output_name, encoding=encoding, mode="a", consolidated=False
+        )
+
+
+class GeotiffStackWriter:
+    """Writer for GeoTIFF format - creates separate files per date."""
+
+    def __init__(
+        self,
+        output_dir: Path,
+        df: pd.DataFrame,
+        rasterio_profile: dict,
+        keep_bits: int = 10,
+        make_overviews: bool = True,
+    ):
+        self.output_dir = Path(output_dir)
+        self.df = df
+        self.rasterio_profile = rasterio_profile.copy()
+        self.keep_bits = keep_bits
+        self.make_overviews = make_overviews
+
+        # Update profile for single-band GeoTIFF
+        self.rasterio_profile.update(
+            {
+                "count": 1,
+                "driver": "GTiff",
+                "compress": "lzw",
+                "tiled": True,
+                "blockxsize": 256,
+                "blockysize": 256,
+            }
+        )
+
+        # Create date list from dataframe
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            self.dates = sorted(
+                np.array(self.df.secondary_datetime.dt.to_pydatetime()).tolist()
+            )
+
+    def write_minimal_dataset(self, ds: xr.Dataset) -> None:
+        """Write water mask and other minimal datasets."""
+        # Write water mask
+        water_mask_path = self.output_dir / "water_mask.tif"
+        self._write_2d_array(
+            ds.water_mask.values, water_mask_path, dtype="uint8", nodata=255, units=None
+        )
+
+        # Write spatial_ref as metadata file
+        metadata = {
+            "crs_wkt": ds.spatial_ref.crs_wkt,
+            "GeoTransform": ds.spatial_ref.GeoTransform,
+        }
+        with open(self.output_dir / "spatial_ref.json", "w") as f:
+            json.dump(metadata, f, indent=2)
+
+    def write_remaining_variables(self, ds: xr.Dataset) -> None:
+        """Write remaining quality datasets."""
+        for var_name in ds.data_vars:
+            if var_name == "average_temporal_coherence":
+                # This is a 2D array
+                output_path = self.output_dir / f"{var_name}.tif"
+                self._write_2d_array(
+                    ds[var_name].values,
+                    output_path,
+                    dtype="float32",
+                    nodata=np.nan,
+                    units=ds[var_name].attrs.get("units"),
+                )
+            else:
+                # These are 3D arrays - write per date
+                for i, date in enumerate(self.dates):
+                    date_str = date.strftime("%Y%m%d")
+                    output_path = self.output_dir / f"{var_name}_{date_str}.tif"
+
+                    # Get the data for this time index
+                    data = ds[var_name].isel(time=i).values
+                    self._write_2d_array(
+                        data,
+                        output_path,
+                        dtype=data.dtype,
+                        nodata=np.nan,
+                        units=ds[var_name].attrs.get("units"),
+                    )
+
+    def write_displacement_data(self, da: xr.DataArray, data_var: str) -> None:
+        """Write displacement data as separate GeoTIFF files per date."""
+        ref_date = self.dates[0]
+        ref_date_str = ref_date.strftime("%Y%m%d")
+
+        for i, date in enumerate(self.dates[1:], 1):  # Skip first date (reference)
+            date_str = date.strftime("%Y%m%d")
+            output_path = self.output_dir / f"{data_var}_{ref_date_str}_{date_str}.tif"
+
+            # Get the data for this time index
+            data = da.isel(time=i).values
+
+            # Apply rounding if requested
+            if self.keep_bits is not None and np.issubdtype(data.dtype, np.floating):
+                from ._utils import round_mantissa
+
+                data = round_mantissa(data.copy(), keep_bits=self.keep_bits)
+
+            self._write_2d_array(
+                data,
+                output_path,
+                dtype=data.dtype,
+                nodata=np.nan,
+                units=da.attrs.get("units"),
+            )
+
+    def _write_2d_array(
+        self, data: np.ndarray, output_path: Path, dtype=None, nodata=None, units=None
+    ) -> None:
+        """Write a 2D numpy array as a GeoTIFF."""
+        if dtype is None:
+            dtype = data.dtype
+
+        profile = self.rasterio_profile.copy()
+        profile.update({"dtype": dtype})
+        if nodata is not None:
+            profile["nodata"] = nodata
+
+        with rio.open(output_path, "w", **profile) as dst:
+            dst.write(data, 1)
+            if units:
+                dst.units = [units]
+
+            # Build overviews if requested
+            if self.make_overviews:
+                dst.build_overviews([2, 4, 8, 16, 32], rio.enums.Resampling.average)
+
+
 def reformat_stack(
     input_files: list[Path],
-    output_name: str,
+    output_name: str | Path,
     out_chunks: tuple[int, int, int] = (4, 256, 256),
     shard_factors: tuple[int, int, int] = (1, 4, 4),
     drop_vars: Sequence[str] | None = None,
@@ -75,9 +282,9 @@ def reformat_stack(
     ----------
     input_files : Sequence[Path]
         Input DISP-S1 NetCDF files.
-    output_name : str
-        Name of the output file.
-        Must end in ".nc" or ".zarr".
+    output_name : str | Path
+        Name of the output file or directory.
+        Must end in ".nc", ".zarr", or be a directory path for GeoTIFF output.
     out_chunks : tuple[int, int, int]
         Chunking configuration for output DataArray.
         Defaults to (4, 256, 256).
@@ -142,12 +349,18 @@ def reformat_stack(
     start_time = time.time()
     # TODO: is there a special way to save geo metadata with zarr?
     # or GeoZarr still too in flux?
-    if Path(output_name).suffix == ".nc":
+    output_path = Path(output_name)
+    if output_path.suffix == ".nc":
         out_format = "h5netcdf"
-    elif Path(output_name).suffix == ".zarr":
+    elif output_path.suffix == ".zarr":
         out_format = "zarr"
+    elif output_path.suffix == "" or output_path.is_dir():
+        out_format = "geotiff"
+        output_path.mkdir(exist_ok=True, parents=True)
     else:
-        msg = "Only .nc and .zarr output formats are supported"
+        msg = (
+            "Only .nc, .zarr, and directory (for GeoTIFF) output formats are supported"
+        )
         raise ValueError(msg)
 
     if max_workers == 1:
@@ -171,8 +384,26 @@ def reformat_stack(
     # Multiply the chunk sizes by the shard factors
     out_shard_dict = _to_shard_dict(out_chunks, shard_factors)
 
-    dps = disp.DispProductStack.from_file_list(input_files)
-    df = dps.to_dataframe()
+    if out_format != "geotiff":  # Already created for geotiff above
+        dps = disp.DispProductStack.from_file_list(input_files)
+        df = dps.to_dataframe()
+
+    # Create appropriate writer based on output format
+    if out_format == "h5netcdf":
+        writer: StackWriter = NetCDFStackWriter(output_name, out_chunks)
+    elif out_format == "zarr":
+        writer = ZarrStackWriter(output_name, out_chunks, shard_factors)
+    elif out_format == "geotiff":
+        # For GeoTIFF, we need to get the dataframe and rasterio profile
+        dps = disp.DispProductStack.from_file_list(input_files)
+        df = dps.to_dataframe()
+        writer = GeotiffStackWriter(
+            output_path,
+            df,
+            dps.get_rasterio_profile(),
+            keep_bits=10,
+            make_overviews=True,
+        )
 
     # #####################
     # Write minimal dataset
@@ -196,20 +427,8 @@ def reformat_stack(
     # Only keep one water mask, as it's repeated for all frame outputs
     ds_minimal["water_mask"] = ds_minimal["water_mask"].isel(time=0)
 
-    # Configure compression encoding
-    if out_format == "zarr":
-        encoding = _get_zarr_encoding(ds_minimal, out_chunks, add_coords=True)
-        ds_minimal.chunk(out_shard_dict).to_zarr(
-            output_name,
-            encoding=encoding,
-            mode="w",
-            consolidated=False,
-        )
-    else:
-        encoding = _get_netcdf_encoding(ds_minimal, out_chunks)
-        ds_minimal.to_netcdf(
-            output_name, engine="h5netcdf", encoding=encoding, mode="w"
-        )
+    # Write minimal dataset using appropriate writer
+    writer.write_minimal_dataset(ds_minimal)
     print(f"Wrote minimal dataset: {time.time() - start_time:.1f}s")
 
     # ################################
@@ -240,17 +459,9 @@ def reformat_stack(
         if do_round and np.issubdtype(d.dtype, np.floating):
             d.data = round_mantissa(d.data, keep_bits=7)
     print(f"Writing remaining variables: {ds_remaining.data_vars}")
-    # Now here, we'll use the virtual dataset feature of HDF5 if we're writing NetCDF
-    if out_format == "zarr":
-        encoding = _get_zarr_encoding(ds_remaining, out_chunks)
-        ds_remaining.to_zarr(
-            output_name,
-            encoding=encoding,
-            mode="a",
-            consolidated=False,
-        )
-
-    else:
+    # Handle format-specific writing for remaining variables
+    if out_format == "h5netcdf":
+        # Use virtual dataset feature for NetCDF
         create_virtual_stack(
             input_files=dps.filenames,
             output=output_name,
@@ -259,12 +470,10 @@ def reformat_stack(
             ],
         )
         # Write the extra "average_temporal_coherence"
-        encoding = _get_netcdf_encoding(
-            ds_remaining[["average_temporal_coherence"]], out_chunks
-        )
-        ds_remaining[["average_temporal_coherence"]].to_netcdf(
-            output_name, engine="h5netcdf", encoding=encoding, mode="a"
-        )
+        writer.write_remaining_variables(ds_remaining[["average_temporal_coherence"]])
+    else:
+        # For zarr and geotiff, write all remaining variables
+        writer.write_remaining_variables(ds_remaining)
 
     print(f"Wrote remaining: {time.time() - start_time:.1f}s")
 
@@ -308,20 +517,17 @@ def reformat_stack(
     _write_rebased_stack(
         ds,
         df,
-        output_name,
-        out_chunks=out_chunks,
+        writer,
         data_var=DisplacementDataset.DISPLACEMENT,
         reference_method=reference_method,
         reference_row=ref_row,
         reference_col=ref_col,
         border_pixels=reference_border_pixels,
         good_pixel_mask=good_pixel_mask,
-        out_format=out_format,
         ds_corrections=ds_corrections,
         quality_datasets=quality_datasets,
         quality_thresholds=quality_thresholds,
         process_chunk_size=process_chunk_size,
-        shard_factors=shard_factors,
         do_round=do_round,
     )
     print(f"Wrote displacement at {time.time() - start_time:.1f}s")
@@ -329,12 +535,9 @@ def reformat_stack(
         _write_rebased_stack(
             ds,
             df,
-            output_name,
-            out_chunks=out_chunks,
+            writer,
             data_var=DisplacementDataset.SHORT_WAVELENGTH,
-            out_format=out_format,
             process_chunk_size=process_chunk_size,
-            shard_factors=shard_factors,
             do_round=do_round,
         )
         print(f"Wrote short_wavelength_displacement at {time.time() - start_time:.1f}s")
@@ -355,21 +558,19 @@ def _to_shard_dict(
 def _write_rebased_stack(
     ds: xr.Dataset,
     df: pd.DataFrame,
-    output_name: Path | str,
-    out_chunks: tuple[int, int, int],
+    writer: StackWriter,
+    *,
     data_var: DisplacementDataset = DisplacementDataset.DISPLACEMENT,
     reference_method: ReferenceMethod = ReferenceMethod.NONE,
     good_pixel_mask: ArrayLike | None = None,
     border_pixels: int = 3,
     reference_row: int | None = None,
     reference_col: int | None = None,
-    out_format: str = "zarr",
     ds_corrections: xr.Dataset | None = None,
     quality_datasets: Sequence[QualityDataset] | None = None,
     quality_thresholds: Sequence[float] | None = None,
     do_round: bool = True,
     process_chunk_size: tuple[int, int] = (2048, 2048),
-    shard_factors: tuple[int, int, int] = (1, 4, 4),
     nan_policy: str | NaNPolicy = NaNPolicy.propagate,
 ) -> None:
     da_displacement = ds[str(data_var)]
@@ -381,7 +582,6 @@ def _write_rebased_stack(
         "y": process_chunk_size[0],
         "x": process_chunk_size[1],
     }
-    out_shard_dict = _to_shard_dict(out_chunks, shard_factors)
     process_chunks = _ensure_chunks(process_chunks, da_displacement.shape)
     if ds_corrections:
         ds_corrections = ds_corrections.chunk(process_chunks)
@@ -435,18 +635,8 @@ def _write_rebased_stack(
     # Ensure we have the attrs (units) from the original dataset
     da_disp_referenced.attrs.update(ds[data_var].attrs)
 
-    ds_disp = da_disp_referenced.to_dataset(name=str(data_var))
-    if out_format == "zarr":
-        encoding = _get_zarr_encoding(ds_disp, out_chunks, shard_factors=shard_factors)
-        ds_disp.chunk(out_shard_dict).to_zarr(
-            output_name,
-            encoding=encoding,
-            mode="a",
-            consolidated=False,
-        )
-    else:
-        encoding = _get_netcdf_encoding(ds_disp, out_chunks)
-        ds_disp.to_netcdf(output_name, engine="h5netcdf", encoding=encoding, mode="a")
+    # Write using the appropriate writer
+    writer.write_displacement_data(da_disp_referenced, str(data_var))
 
 
 def _get_netcdf_encoding(

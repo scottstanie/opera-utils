@@ -159,9 +159,10 @@ def _get_border_pixels(
 
     """
     mask = np.zeros(da.shape[-2:], dtype=bool)
-    mask[:num_border_pixels, :] = True  # top
-    mask[-num_border_pixels:, :] = True  # bottom
-    mask[:, :num_border_pixels] = True  # left
-    mask[:, -num_border_pixels:] = True  # right
+    # Set top, bottom, left, right border pixels to True
+    mask[:num_border_pixels, :] = True
+    mask[-num_border_pixels:, :] = True
+    mask[:, :num_border_pixels] = True
+    mask[:, -num_border_pixels:] = True
     # Stack the border regions together
     return da.where(mask).stack(pixels=("y", "x")).dropna("pixels")
