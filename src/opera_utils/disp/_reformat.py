@@ -35,7 +35,7 @@ from ._reference import (
     _get_reference_row_col,
     get_reference_values,
 )
-from ._utils import _ensure_chunks, round_mantissa
+from ._utils import _ensure_chunks, _get_netcdf_encoding, round_mantissa
 
 logger = logging.getLogger("opera_utils")
 QUALITY_DATASETS = list(QualityDataset)
@@ -156,6 +156,8 @@ def reformat_stack(
     out_shard_dict = _to_shard_dict(out_chunks, shard_factors)
 
     dps = disp.DispProductStack.from_file_list(input_files)
+    df = dps.to_dataframe()
+    reference_datetimes = df.reference_datetime.dt.tz_localize(None)
 
     df = dps.to_dataframe()
     reference_datetimes = df.reference_datetime.dt.tz_localize(None)
@@ -197,7 +199,7 @@ def reformat_stack(
         ds_minimal.to_netcdf(
             output_name, engine="h5netcdf", encoding=encoding, mode="w"
         )
-    print(f"Wrote minimal dataset: {ds_minimal} in {time.time() - start_time:.1f}s")
+    print(f"Wrote minimal dataset: {ds_minimal}\n in {time.time() - start_time:.1f}s")
 
     # ################################
     # Write non-displacement variables
@@ -423,9 +425,27 @@ def _write_rebased_stack(
         process_chunk_size=process_chunk_size,
         nan_policy=nan_policy,
     )
-    da_disp = da_disp.assign_coords(spatial_ref=ds.spatial_ref)
-    if do_round and np.issubdtype(da_disp.dtype, np.floating):
-        da_disp.data = round_mantissa(da_disp.data, keep_bits=10)
+    if reference_method is not ReferenceMethod.NONE:
+        crs = CRS.from_wkt(ds.spatial_ref.crs_wkt)
+        transform = _get_transform(ds)
+        logger.info(f"spatially referencing with {reference_method}")
+        ref_values = get_reference_values(
+            da_disp,
+            method=reference_method,
+            row=reference_row,
+            col=reference_col,
+            crs=crs,
+            transform=transform,
+            border_pixels=border_pixels,
+            good_pixel_mask=good_pixel_mask,
+        )
+        da_disp_referenced = da_disp - ref_values
+    else:
+        da_disp_referenced = da_disp
+
+    da_disp_referenced = da_disp_referenced.assign_coords(spatial_ref=ds.spatial_ref)
+    if do_round and np.issubdtype(da_disp_referenced.dtype, np.floating):
+        da_disp_referenced.data = round_mantissa(da_disp_referenced.data, keep_bits=10)
 
     # Ensure we have the attrs (units) from the original dataset
     da_disp.attrs.update(ds[data_var].attrs)
@@ -442,26 +462,6 @@ def _write_rebased_stack(
     else:
         encoding = _get_netcdf_encoding(ds_disp, out_chunks)
         ds_disp.to_netcdf(output_name, engine="h5netcdf", encoding=encoding, mode="a")
-
-
-def _get_netcdf_encoding(
-    ds: xr.Dataset,
-    chunks: tuple[int, int, int],
-    compression_level: int = 6,
-    data_vars: Sequence[str] = [],
-) -> dict:
-    encoding = {}
-    comp = {"zlib": True, "complevel": compression_level, "chunksizes": chunks}
-    if not data_vars:
-        data_vars = list(ds.data_vars)
-    encoding = {var: comp for var in data_vars if ds[var].ndim >= 2}
-    for var in data_vars:
-        if ds[var].ndim < 2:
-            continue
-        encoding[var] = comp
-        if ds[var].ndim == 2:
-            encoding[var]["chunksizes"] = chunks[-2:]
-    return encoding
 
 
 def _get_zarr_encoding(
