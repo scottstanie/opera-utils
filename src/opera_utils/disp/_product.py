@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from collections import Counter
 from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass
@@ -29,7 +30,94 @@ from opera_utils.constants import DISP_FILE_REGEX
 
 from ._utils import get_frame_coordinates
 
-__all__ = ["DispProduct", "DispProductStack", "UrlType"]
+__all__ = [
+    "DispProduct",
+    "DispProductStack",
+    "DispStaticProduct",
+    "StaticAsset",
+    "UrlType",
+]
+
+
+# Regex for DISP-S1-STATIC products
+DISP_STATIC_FILE_REGEX = re.compile(
+    r"OPERA_L3_DISP-S1-STATIC"
+    r"_F(?P<frame_id>\d{5})"
+    r"_(?P<acquisition_date>\d{8})"
+    r"_(?P<sensor>S1[AB])"
+    r"_v(?P<version>[\d\.]+)$"
+)
+
+
+class StaticAsset(str, Enum):
+    """Types of static auxiliary files."""
+
+    DEM = "dem"
+    LOS_ENU = "los_enu"
+    LAYOVER_SHADOW_MASK = "layover_shadow_mask"
+
+    def __str__(self) -> str:
+        return str(self.value)
+
+
+@dataclass(frozen=True)
+class StaticAssetUrls:
+    """URLs for one static asset with fallback logic."""
+
+    https: str | None
+    s3: str | None
+
+    def pick(self, url_type: UrlType) -> str:
+        """Select URL based on preference with fallback."""
+        if url_type == UrlType.S3:
+            if self.s3:
+                return self.s3
+            if self.https:
+                return self.https
+            msg = "No S3 or HTTPS URL available"
+            raise ValueError(msg)
+        # HTTPS preferred
+        if self.https:
+            return self.https
+        if self.s3:
+            return self.s3
+        msg = "No HTTPS or S3 URL available"
+        raise ValueError(msg)
+
+
+class FrameProductMixin:
+    """Shared frame-related properties."""
+
+    frame_id: int
+
+    @cached_property
+    def _frame_bbox_result(self) -> tuple[int, Bbox]:
+        return get_frame_bbox(self.frame_id)
+
+    @cached_property
+    def orbit_pass(self) -> OrbitPass:
+        return get_frame_orbit_pass(self.frame_id)[0]
+
+    @property
+    def epsg(self) -> int:
+        return self._frame_bbox_result[0]
+
+    @property
+    def crs(self) -> pyproj.CRS:
+        return pyproj.CRS.from_epsg(self.epsg)
+
+    def reproject_bbox_from_lonlat(
+        self,
+        bbox_ll: tuple[float, float, float, float],
+    ) -> tuple[float, float, float, float]:
+        """Reproject lon/lat bbox to frame CRS."""
+        left, bottom, right, top = bbox_ll
+        transformer = pyproj.Transformer.from_crs(
+            "EPSG:4326", f"EPSG:{self.epsg}", always_xy=True
+        )
+        x0, y0 = transformer.transform(left, bottom)
+        x1, y1 = transformer.transform(right, top)
+        return (min(x0, x1), min(y0, y1), max(x0, x1), max(y1, y1))
 
 
 class ProductType(str, Enum):
@@ -53,7 +141,7 @@ class UrlType(str, Enum):
 
 
 @dataclass
-class DispProduct:
+class DispProduct(FrameProductMixin):
     """Class for information from one DISP-S1 production filename."""
 
     filename: str | Path
@@ -105,24 +193,8 @@ class DispProduct:
         return cls(filename=name, **data)
 
     @cached_property
-    def _frame_bbox_result(self) -> tuple[int, Bbox]:
-        return get_frame_bbox(self.frame_id)
-
-    @cached_property
     def frame_geojson(self) -> dict:
         return get_frame_geojson(frame_ids=[self.frame_id])
-
-    @cached_property
-    def orbit_pass(self) -> OrbitPass:
-        return get_frame_orbit_pass(self.frame_id)[0]
-
-    @property
-    def epsg(self) -> int:
-        return self._frame_bbox_result[0]
-
-    @property
-    def crs(self) -> pyproj.CRS:
-        return pyproj.CRS.from_epsg(self.epsg)
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -227,6 +299,66 @@ class DispProduct:
         size_in_bytes = archive_info[0].get("SizeInBytes", 0) if archive_info else None
         product.size_in_bytes = size_in_bytes
         return product
+
+
+@dataclass
+class DispStaticProduct(FrameProductMixin):
+    """DISP-S1-STATIC product with 3 auxiliary GeoTIFF assets."""
+
+    granule_ur: str
+    frame_id: int
+    sensor: str | None
+    version: str
+    assets: dict[StaticAsset, StaticAssetUrls]
+
+    def __repr__(self) -> str:
+        return (
+            f"DispStaticProduct(F{self.frame_id}, v{self.version},"
+            f" assets={list(self.assets)})"
+        )
+
+    @classmethod
+    def from_umm(cls, umm_data: dict[str, Any]) -> DispStaticProduct:
+        """Create from UMM metadata."""
+        granule_ur = umm_data["GranuleUR"]
+
+        # Parse frame ID from granule UR
+        if not (match := DISP_STATIC_FILE_REGEX.match(granule_ur)):
+            msg = f"Invalid DISP-S1-STATIC format: {granule_ur}"
+            raise ValueError(msg)
+
+        data = match.groupdict()
+        frame_id = int(data["frame_id"])
+
+        # Extract sensor from platforms
+        plats = umm_data.get("Platforms") or []
+        sensor = None
+        if plats and isinstance(plats[0], dict):
+            sensor = plats[0].get("ShortName")
+
+        # Extract URLs for each asset type
+        assets = _extract_static_asset_urls(umm_data)
+
+        return cls(
+            granule_ur=granule_ur,
+            frame_id=frame_id,
+            sensor=sensor,
+            version=data["version"],
+            assets=assets,
+        )
+
+    def url_for(self, asset: StaticAsset, url_type: UrlType) -> str:
+        """Get URL for specific asset."""
+        return self.assets[asset].pick(url_type)
+
+    @property
+    def bounds(self) -> Bbox:
+        """Frame bounds (same as NetCDF products)."""
+        return self._frame_bbox_result[1]
+
+    def __fspath__(self) -> str:
+        """Return representative path (DEM URL)."""
+        return self.url_for(StaticAsset.DEM, UrlType.HTTPS)
 
 
 @dataclass
@@ -367,6 +499,50 @@ def _get_download_url(
 
     msg = f"No download URL found for granule {umm_data['GranuleUR']}"
     raise ValueError(msg)
+
+
+def _extract_static_asset_urls(
+    umm_data: dict[str, Any], *, strict: bool = True
+) -> dict[StaticAsset, StaticAssetUrls]:
+    """Extract URLs for all three static assets from UMM data."""
+    assets = {asset: StaticAssetUrls(https=None, s3=None) for asset in StaticAsset}
+
+    def classify_asset(url: str) -> StaticAsset | None:
+        """Determine asset type from URL."""
+        name = Path(url).name.lower()
+        if name.endswith("_dem_warped_utm.tif"):
+            return StaticAsset.DEM
+        elif name.endswith("_los_enu.tif"):
+            return StaticAsset.LOS_ENU
+        elif name.endswith("_layover_shadow_mask.tif"):
+            return StaticAsset.LAYOVER_SHADOW_MASK
+        return None
+
+    for url_record in umm_data.get("RelatedUrls", []):
+        url = url_record.get("URL") or ""
+        url_type = (url_record.get("Type") or "").upper()
+
+        if not url or not url_type.startswith("GET DATA"):
+            continue
+
+        asset = classify_asset(url)
+        if not asset:
+            continue
+
+        # Update the appropriate URL field
+        current = assets[asset]
+        if url.startswith("s3://"):
+            assets[asset] = StaticAssetUrls(https=current.https, s3=url)
+        elif url.startswith("http"):
+            assets[asset] = StaticAssetUrls(https=url, s3=current.s3)
+
+    if strict:
+        missing = [a for a, u in assets.items() if not (u.https or u.s3)]
+        if missing:
+            msg = f"Missing URLs for {missing} in {umm_data.get('GranuleUR')}"
+            raise ValueError(msg)
+
+    return assets
 
 
 class OutOfBoundsError(ValueError):

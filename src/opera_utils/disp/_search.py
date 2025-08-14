@@ -16,7 +16,12 @@ from datetime import datetime, timezone
 
 import requests
 
-from opera_utils.disp._product import DispProduct, ProductType, UrlType
+from opera_utils.disp._product import (
+    DispProduct,
+    DispStaticProduct,
+    ProductType,
+    UrlType,
+)
 
 __all__ = ["search"]
 
@@ -34,7 +39,6 @@ def search(
     start_datetime: datetime | None = None,
     end_datetime: datetime | None = None,
     url_type: UrlType = UrlType.HTTPS,
-    product_type: str | ProductType = ProductType.DISP_S1,
     use_uat: bool = False,
     print_urls: bool = False,
 ) -> list[DispProduct]:
@@ -61,14 +65,14 @@ def search(
 
     Returns
     -------
-    list[DispProduct]
+    list[DispProduct] | list[DispStaticProduct]
         List of products matching the search criteria
 
     """
     edl_host = "uat.earthdata" if use_uat else "earthdata"
     search_url = f"https://cmr.{edl_host}.nasa.gov/search/granules.umm_json"
     params: dict[str, int | str | list[str]] = {
-        "short_name": CMR_SHORT_NAMES[ProductType(product_type)],
+        "short_name": CMR_SHORT_NAMES[ProductType.DISP_S1],
         "page_size": 2000,
     }
     # Optionally narrow search by frame id, product version
@@ -78,7 +82,7 @@ def search(
     if product_filters:
         params["attribute[]"] = product_filters
 
-    # Optionally narrow search by temporal range
+    # Only add temporal range for DISP_S1 products (not for STATIC)
     if start_datetime is not None or end_datetime is not None:
         start_str = start_datetime.isoformat() if start_datetime is not None else ""
         end_str = end_datetime.isoformat() if end_datetime is not None else ""
@@ -101,38 +105,100 @@ def search(
         warnings.warn("No `frame_id` specified: search may be large", stacklevel=1)
 
     headers: dict[str, str] = {}
-    products: list[DispProduct] = []
+    products = []
     while True:
         response = requests.get(search_url, params=params, headers=headers)
         response.raise_for_status()
         data = response.json()
         umms = [item["umm"] for item in data["items"]]
-        if product_type == ProductType.DISP_S1:
-            cur_products = [DispProduct.from_umm(u, url_type=url_type) for u in umms]
-            # CMR filters apply to both the reference and secondary time (as of 2025-03-29)
-            # We want to filter just by the secondary time
-            products.extend(
-                [
-                    g
-                    for g in cur_products
-                    if start_datetime <= g.secondary_datetime <= end_datetime
-                ]
-            )
-        else:
-            # ????
-            from rich import print
 
-            print(data["items"][0])
-            products.extend(cur_products)
+        if not umms:
+            break
+
+        cur_products: list[DispProduct]
+        cur_products = [DispProduct.from_umm(u, url_type=url_type) for u in umms]
+        # CMR filters use both the reference and secondary time (as of 2025-03-29)
+        # We want to filter just by the secondary time
+        products.extend(
+            [
+                g
+                for g in cur_products
+                if start_datetime <= g.secondary_datetime <= end_datetime
+            ]
+        )
 
         if "CMR-Search-After" not in response.headers:
             break
 
         headers["CMR-Search-After"] = response.headers["CMR-Search-After"]
 
-    # Return sorted list of products
     products = sorted(products, key=lambda g: (g.frame_id, g.secondary_datetime))
+
     if print_urls:
         for p in products:
             print(p.filename)
+
+    return products
+
+
+def search_static(
+    frame_id: int,
+    url_type: UrlType = UrlType.HTTPS,
+    use_uat: bool = False,
+) -> list[DispStaticProduct]:
+    """Query the CMR for granules matching the given frame ID and product version.
+
+    Parameters
+    ----------
+    frame_id : int, optional
+        The frame ID to search for
+    url_type : UrlType
+        The protocol to use for downloading, either "s3" or "https".
+    use_uat : bool
+        Whether to use the UAT environment instead of main Earthdata endpoint.
+    print_urls : bool
+        If True, prints out the result urls to stdout in addition to returning
+        the `DispProduct` objects.
+        Default is False.
+
+    Returns
+    -------
+    list[DispProduct] | list[DispStaticProduct]
+        List of products matching the search criteria
+
+    """
+    edl_host = "uat.earthdata" if use_uat else "earthdata"
+    search_url = f"https://cmr.{edl_host}.nasa.gov/search/granules.umm_json"
+    params: dict[str, int | str | list[str]] = {
+        "short_name": CMR_SHORT_NAMES[ProductType.DISP_S1_STATIC],
+        "page_size": 2000,
+    }
+
+    if frame_id:
+        params["attribute[]"] = f"int,FRAME_NUMBER,{frame_id}"
+    else:
+        warnings.warn("No `frame_id` specified: search may be large", stacklevel=1)
+
+    headers: dict[str, str] = {}
+    products = []
+    print(params)
+    while True:
+        response = requests.get(search_url, params=params, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        umms = [item["umm"] for item in data["items"]]
+
+        if not umms:
+            break
+
+        # Static products don't have temporal filtering
+        cur_products = [DispStaticProduct.from_umm(u) for u in umms]
+        products.extend(cur_products)
+
+        if "CMR-Search-After" not in response.headers:
+            break
+
+        headers["CMR-Search-After"] = response.headers["CMR-Search-After"]
+
+    products = sorted(products, key=lambda g: (g.frame_id))
     return products

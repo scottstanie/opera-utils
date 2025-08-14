@@ -4,20 +4,144 @@ from datetime import datetime
 from pathlib import Path
 
 import h5py
+import rasterio as rio
 import requests
 import xarray as xr
+from rasterio.windows import from_bounds
 from shapely import from_wkt
 from tqdm.auto import tqdm
 from tqdm.contrib.concurrent import process_map
 
 from opera_utils.credentials import get_earthdata_username_password
 
-from ._product import DispProductStack
+from ._product import DispProductStack, DispStaticProduct, ProductType, StaticAsset
 from ._remote import open_file
 from ._search import UrlType, search
 from ._utils import _get_netcdf_encoding
 
 logger = logging.getLogger("opera_utils")
+
+
+def download_static_products(
+    frame_id: int,
+    output_dir: Path = Path("./static"),
+    bbox: tuple[float, float, float, float] | None = None,
+    bbox_crs: str = "EPSG:4326",  # lonlat by default
+    url_type: UrlType = UrlType.HTTPS,
+    use_uat: bool = False,
+    num_workers: int = 4,
+) -> list[Path]:
+    """Download DISP-S1-STATIC auxiliary files.
+
+    Parameters
+    ----------
+    frame_id : int
+        Frame ID to download static products for
+    output_dir : Path
+        Directory to save files to
+    bbox : tuple, optional
+        Bounding box for subsetting (left, bottom, right, top)
+    bbox_crs : str
+        CRS of the bbox coordinates (default: "EPSG:4326" for lon/lat)
+    url_type : UrlType
+        URL type preference (HTTPS or S3)
+    use_uat : bool
+        Use UAT environment
+    num_workers : int
+        Number of parallel workers
+
+    Returns
+    -------
+    list[Path]
+        Paths to downloaded files
+
+    """
+    products = search(
+        frame_id=frame_id,
+        product_type=ProductType.DISP_S1_STATIC,
+        url_type=url_type,
+        use_uat=use_uat,
+    )
+
+    if not products:
+        logger.info(f"No static products found for frame {frame_id}")
+        return []
+
+    if len(products) > 1:
+        logger.warning(
+            f"Found {len(products)} static products for frame {frame_id}. "
+            "Using the first result, which is the most recent version."
+        )
+
+    # Take the first/most recent product
+    product: DispStaticProduct = products[0]
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Reproject bbox if needed
+    if bbox and bbox_crs != f"EPSG:{product.epsg}":
+        bbox = product.reproject_bbox_from_lonlat(bbox)
+
+    # Create download jobs for all 3 assets
+    jobs = []
+    for asset in StaticAsset:
+        url = product.url_for(asset, url_type)
+        outpath = output_dir / Path(url).name
+        jobs.append((url, outpath, bbox))
+
+    if num_workers == 1:
+        return [_download_static_file(*job) for job in tqdm(jobs)]
+    else:
+        return process_map(_download_static_file, jobs, max_workers=num_workers)
+
+
+def _download_static_file(url: str, outpath: Path, bbox: tuple | None) -> Path:
+    """Download and optionally subset a single GeoTIFF."""
+    if outpath.exists():
+        logger.info(f"Skipped (exists): {outpath}")
+        return outpath
+
+    logger.info(f"Downloading {url} -> {outpath}")
+
+    # Use existing open_file for s3/https handling
+    with open_file(url) as file_obj:
+        if bbox is None:
+            # Simple copy without subsetting
+            with rio.open(file_obj) as src:
+                profile = src.profile.copy()
+                profile.update(
+                    driver="GTiff", tiled=True, compress="lzw", BIGTIFF="IF_SAFER"
+                )
+                with rio.open(outpath, "w", **profile) as dst:
+                    dst.write(src.read())
+                    dst.update_tags(**src.tags())
+                    # Copy band tags
+                    for b in range(1, src.count + 1):
+                        dst.update_tags(b, **src.tags(b))
+        else:
+            # Subset with bbox
+            with rio.open(file_obj) as src:
+                window = from_bounds(*bbox, src.transform)
+                window = window.round_offsets().round_lengths()
+
+                profile = src.profile.copy()
+                profile.update(
+                    driver="GTiff",
+                    width=int(window.width),
+                    height=int(window.height),
+                    transform=src.window_transform(window),
+                    tiled=True,
+                    compress="lzw",
+                    BIGTIFF="IF_SAFER",
+                )
+
+                with rio.open(outpath, "w", **profile) as dst:
+                    dst.write(src.read(window=window))
+                    dst.update_tags(**src.tags())
+                    # Copy band tags
+                    for b in range(1, src.count + 1):
+                        dst.update_tags(b, **src.tags(b))
+
+    return outpath
 
 
 def process_file(
