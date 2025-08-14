@@ -16,19 +16,25 @@ from datetime import datetime, timezone
 
 import requests
 
-from opera_utils.disp._product import DispProduct, UrlType
+from opera_utils.disp._product import DispProduct, ProductType, UrlType
 
 __all__ = ["search"]
 
 logger = logging.getLogger("opera_utils")
 
+CMR_SHORT_NAMES = {
+    ProductType.DISP_S1: "OPERA_L3_DISP-S1_V1",
+    ProductType.DISP_S1_STATIC: "OPERA_L3_DISP-S1-STATIC_V1",
+}
+
 
 def search(
     frame_id: int | None = None,
-    product_version: str | None = "1.0",
+    product_version: str | None = "1",
     start_datetime: datetime | None = None,
     end_datetime: datetime | None = None,
     url_type: UrlType = UrlType.HTTPS,
+    product_type: str | ProductType = ProductType.DISP_S1,
     use_uat: bool = False,
     print_urls: bool = False,
 ) -> list[DispProduct]:
@@ -62,7 +68,7 @@ def search(
     edl_host = "uat.earthdata" if use_uat else "earthdata"
     search_url = f"https://cmr.{edl_host}.nasa.gov/search/granules.umm_json"
     params: dict[str, int | str | list[str]] = {
-        "short_name": "OPERA_L3_DISP-S1_V1",
+        "short_name": CMR_SHORT_NAMES[ProductType(product_type)],
         "page_size": 2000,
     }
     # Optionally narrow search by frame id, product version
@@ -100,19 +106,24 @@ def search(
         response = requests.get(search_url, params=params, headers=headers)
         response.raise_for_status()
         data = response.json()
-        cur_products = [
-            DispProduct.from_umm(item["umm"], url_type=url_type)
-            for item in data["items"]
-        ]
-        # CMR filters apply to both the reference and secondary time (as of 2025-03-29)
-        # We want to filter just by the secondary time
-        products.extend(
-            [
-                g
-                for g in cur_products
-                if start_datetime <= g.secondary_datetime <= end_datetime
-            ]
-        )
+        umms = [item["umm"] for item in data["items"]]
+        if product_type == ProductType.DISP_S1:
+            cur_products = [DispProduct.from_umm(u, url_type=url_type) for u in umms]
+            # CMR filters apply to both the reference and secondary time (as of 2025-03-29)
+            # We want to filter just by the secondary time
+            products.extend(
+                [
+                    g
+                    for g in cur_products
+                    if start_datetime <= g.secondary_datetime <= end_datetime
+                ]
+            )
+        else:
+            # ????
+            from rich import print
+
+            print(data["items"][0])
+            products.extend(cur_products)
 
         if "CMR-Search-After" not in response.headers:
             break

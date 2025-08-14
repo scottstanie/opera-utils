@@ -32,6 +32,16 @@ from ._utils import get_frame_coordinates
 __all__ = ["DispProduct", "DispProductStack", "UrlType"]
 
 
+class ProductType(str, Enum):
+    """Choices for the orbit direction of a granule."""
+
+    DISP_S1 = "disp_s1"
+    DISP_S1_STATIC = "disp_s1_static"
+
+    def __str__(self) -> str:
+        return str(self.value)
+
+
 class UrlType(str, Enum):
     """Choices for the orbit direction of a granule."""
 
