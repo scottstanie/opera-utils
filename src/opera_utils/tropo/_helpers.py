@@ -134,3 +134,16 @@ def _height_to_utm_surface(
     out = dem_utm.copy()
     out.values[:] = interp.reshape(dem_utm.shape).astype("float32")
     return out
+
+
+def raster_to_binary(raster_tif: Path | str, out_npy: Path | None = None):
+    da = rxr.open_rasterio(raster_tif).squeeze(drop=True)
+    arr = da.values.astype("float32", copy=False)
+    if out_npy is None:
+        out_npy = Path(raster_tif).with_suffix(".bin")
+    arr.tofile(out_npy)
+    return out_npy, da.shape
+
+
+def load_memmap(path: str | Path, shape: tuple[int, int]) -> np.memmap:
+    return np.memmap(path, dtype="float32", mode="r", shape=shape)

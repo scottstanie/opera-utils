@@ -15,7 +15,7 @@ from tqdm.auto import tqdm
 
 from opera_utils import get_dates, sort_files_by_date
 
-from ._helpers import _open_2d
+from ._helpers import _open_2d, load_memmap
 
 logger = logging.getLogger(__name__)
 
@@ -86,20 +86,16 @@ def _height_to_dem_surface(
 
 def _compute_reference_correction(
     first_cropped: Path,
-    dem_path: Path,
-    incidence_angle_path: Path,
+    dem_bin_path: Path,
+    incidence_angle_bin_path: Path,
     interp_method: str,
 ) -> xr.DataArray:
     """Compute the day-1 LOS correction once (serial)."""
-    dem = _open_2d(dem_path)
-    los_up = _read_los_up(incidence_angle_path)
-
     ds0 = xr.open_dataset(first_cropped, engine="h5netcdf")
+    shape = ds0.total_delay.shape
+    dem = load_memmap(dem_bin_path, shape)
     zenith_delay_2d = _height_to_dem_surface(ds0.total_delay, dem, method=interp_method)
 
-    if los_up.shape != zenith_delay_2d.shape:
-        # reproject/align LOS raster to dem grid just in case
-        los_up = los_up.rio.reproject_match(zenith_delay_2d)
     # Note the -1: match the line-of-sight convention of DISP
     # where positive means apparent uplift (decrease in delay)
     ref_corr = -1 * (zenith_delay_2d / los_up)
@@ -112,7 +108,7 @@ def _compute_reference_correction(
 def _create_reference_correction(
     ref_tropo_file: Path,
     ref_date_str: str,
-    dem_path: Path,
+    dem_bin_path: Path,
     incidence_angle_path: Path,
     interp_method: str,
     output_dir: Path,
@@ -123,7 +119,7 @@ def _create_reference_correction(
     else:
         logger.info(f"Computing reference correction for {ref_date_str}")
         ref_corr = _compute_reference_correction(
-            ref_tropo_file, dem_path, incidence_angle_path, interp_method
+            ref_tropo_file, dem_bin_path, incidence_angle_path, interp_method
         )
         ref_corr.rio.to_raster(ref_corr_path, **GTIFF_KWARGS)
     return ref_corr_path
@@ -131,8 +127,9 @@ def _create_reference_correction(
 
 def _apply_one(
     cropped_file: Path,
-    dem_path: Path,
-    incidence_angle_path: Path,
+    dem_bin_path: Path,
+    incidence_angle_bin_path: Path,
+    dem_shape: tuple[int, int],
     interp_method: str,
     output_file: Path,
     ref_corr_path: Path | None,
@@ -146,16 +143,15 @@ def _apply_one(
         if output_file.exists():
             return (date_str, "skipped")
 
-        dem = _open_2d(dem_path)
-        los_up = _read_los_up(incidence_angle_path)
+        dem = np.memmap(dem_bin_path, dtype="float32", mode="r", shape=dem_shape)
+        los_up = np.memmap(
+            incidence_angle_bin_path, dtype="float32", mode="r", shape=dem_shape
+        )
 
         ds = xr.open_dataset(cropped_file, engine="h5netcdf")
         zenith_delay_2d = _height_to_dem_surface(
             ds.total_delay, dem, method=interp_method
         )
-        if los_up.shape != zenith_delay_2d.shape:
-            # reproject/align LOS raster to dem grid just in case
-            los_up = los_up.rio.reproject_match(zenith_delay_2d)
         # Note the -1: match the line-of-sight convention of DISP
         # where positive means apparent uplift (decrease in delay)
         los_correction = -1 * (zenith_delay_2d / los_up)
@@ -241,13 +237,25 @@ def apply_tropo(
     ref_corr_path: Path | None = None
     ref_date_str: str | None = None
 
+    # Setup the incidence and DEM as memmaps
+    dem = _open_2d(dem_path)
+    dem_bin_path = dem_path.with_suffix(".bin")
+    dem.values.astype("float32").tofile(dem_bin_path)
+
+    los_up = _read_los_up(incidence_angle_path)
+    if los_up.shape != dem.shape:
+        # reproject/align LOS raster to dem grid just in case
+        los_up = los_up.rio.reproject_match(dem)
+    los_up_bin_path = incidence_angle_path.with_suffix(".bin")
+    los_up.values.astype("float32").tofile(los_up_bin_path)
+
     # Precompute reference correction once if requested
     if subtract_first_date:
         ref_corr_path = _create_reference_correction(
             Path(files_sorted[0]),
             dates_sorted[0].strftime(fmt),
-            dem_path,
-            incidence_angle_path,
+            dem_bin_path,
+            los_up_bin_path,
             interp_method,
             output_dir,
         )
@@ -270,8 +278,9 @@ def apply_tropo(
             ex.submit(
                 _apply_one,
                 Path(cropped_file),
-                dem_path,
-                incidence_angle_path,
+                dem_bin_path,
+                los_up_bin_path,
+                dem_shape,
                 interp_method,
                 Path(out_file),
                 ref_corr_path,
