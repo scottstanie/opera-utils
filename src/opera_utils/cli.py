@@ -161,11 +161,13 @@ def cli_app() -> None:
         pass
 
     try:
+        from opera_utils.disp.fit import fit_cli
         from opera_utils.tropo._apply import apply_tropo
         from opera_utils.tropo._crop import crop_tropo
 
         cli_dict["tropo-crop"] = crop_tropo
         cli_dict["tropo-apply"] = apply_tropo
+        cli_dict["disp-s1-fit"] = fit_cli
 
     except ImportError:
         pass
