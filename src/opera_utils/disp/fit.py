@@ -9,6 +9,7 @@ import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
+from math import factorial
 from pathlib import Path
 from typing import Literal
 
@@ -17,6 +18,14 @@ import xarray as xr
 
 from ._product import DispProductStack
 from ._rebase import rebase_timeseries
+
+try:
+    import jax
+    import jax.numpy as jnp
+
+    JAX_AVAILABLE = True
+except ImportError:
+    JAX_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -123,8 +132,6 @@ def build_design_matrix(
 
     # Poly terms: constant, linear (velocity), quadratic, cubic
     # factorial normalization for conditioning
-    from math import factorial
-
     for i, name in enumerate(
         ["constant", "linear_trend", "quadratic", "cubic"][: poly_degree + 1]
     ):
@@ -229,47 +236,46 @@ def _fit_block_numpy(
 
 
 def _maybe_jax_fit(
-    A: np.ndarray, Y: np.ndarray, valid: np.ndarray, use_jax: bool
+    design_matrix: np.ndarray,
+    observations: np.ndarray,
+    valid: np.ndarray,
+    use_jax: bool,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Fit using JAX if available, otherwise fall back to NumPy."""
-    if not use_jax:
-        return _fit_block_numpy(A, Y, valid)
-    try:
-        import jax
-        import jax.numpy as jnp
-    except Exception:
-        logger.warning("Falling back to NumPy fit (JAX unavailable).")
-        return _fit_block_numpy(A, Y, valid)
+    if not use_jax or not JAX_AVAILABLE:
+        logger.debug("Falling back to NumPy fit (JAX unavailable).")
+        return _fit_block_numpy(design_matrix, observations, valid)
 
-    Aj = jnp.array(A)  # (T,P)
-    Yj = jnp.array(Y)  # (T,N)
-    Vj = jnp.array(valid)  # (T,N)
-    _T, P = A.shape
+    design_jax = jnp.asarray(design_matrix)  # (T, P)
+    obs_jax = jnp.asarray(observations)  # (T, N)
+    valid_jax = jnp.asarray(valid)  # (T, N)
+    _T, P = design_matrix.shape
 
     @jax.vmap
     def _solve_pixel(y_col: jnp.ndarray, v_col: jnp.ndarray):
-        m = v_col.astype(bool)
-        Ajm = Aj[m, :]
-        yjm = y_col[m]
+        # v_col is bool-like (T,). Build row weights w in {0,1} without bool indexing
+        w = v_col.astype(design_jax.dtype)  # (T,)
+        nobs = jnp.sum(v_col.astype(jnp.int32))  # scalar int
 
-        # fall back if too few obs
+        # Weighted rows: zero-out invalid rows by multiplication (JAX-friendly).
+        A_w = design_jax * w[:, None]  # (T, P)
+        y_w = y_col * w  # (T,)
+
         def _bad():
             return jnp.full((P,), jnp.nan), jnp.array(jnp.nan)
 
         def _ok():
-            x, residuals, rank, _ = jnp.linalg.lstsq(Ajm, yjm, rcond=None)
-            dof = jnp.maximum(1, yjm.shape[0] - rank)
-            mse = jnp.where(
-                residuals.size > 0,
-                residuals[0] / dof,
-                jnp.sum((Ajm @ x - yjm) ** 2) / dof,
-            )
+            x, _residuals, rank, _ = jnp.linalg.lstsq(A_w, y_w, rcond=None)
+            # Compute MSE on valid rows only (weighted residuals == masked residuals)
+            r = (design_jax @ x - y_col) * w
+            dof = jnp.maximum(1, nobs - rank)
+            mse = jnp.sum(r * r) / dof.astype(r.dtype)
             return x, mse
 
-        return jax.lax.cond(Ajm.shape[0] < P, _bad, _ok)
+        return jax.lax.cond(nobs < P, _bad, _ok)
 
-    X, M = _solve_pixel(Yj.T, Vj.T)  # (N,P), (N,)
-    return np.asarray(X.T), np.asarray(M)
+    coef_result, mse_result = _solve_pixel(obs_jax.T, valid_jax.T)  # (N,P), (N,)
+    return np.asarray(coef_result.T), np.asarray(mse_result)
 
 
 # Public API
@@ -415,7 +421,7 @@ def fit_disp_timeseries(
     )
 
     # Convenience layers
-    # velocity (linear term) = 1st-order coefficient scaled by factorial(1)=1 per our normalization
+    # velocity (linear term) = 1st-order coefficient scaled by factorial(1)=1
     vel = _maybe("linear_trend")
     if vel is not None:
         ds_fit["velocity"] = vel
