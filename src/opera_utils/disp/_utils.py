@@ -161,7 +161,7 @@ def _get_netcdf_encoding(
     comp = {"zlib": True, "complevel": compression_level, "chunksizes": chunks}
     if not data_vars:
         data_vars = list(ds.data_vars)
-    encoding = {var: comp for var in data_vars if ds[var].ndim >= 2}
+    encoding = {var: comp.copy() for var in data_vars if ds[var].ndim >= 2}
     for var in data_vars:
         if ds[var].ndim < 2:
             continue
