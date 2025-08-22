@@ -47,7 +47,7 @@ def rebase_displacement(ds: xr.Dataset) -> xr.DataArray:
     """
     displacement_var = "displacement"
     reference_time_var = "reference_time"
-    da = ds[displacement_var]
+    da_disp = ds[displacement_var]
     refs = ds[reference_time_var].values
 
     # Make the map_blocks-compatible function to accumulate the displacement
@@ -55,7 +55,7 @@ def rebase_displacement(ds: xr.Dataset) -> xr.DataArray:
         out = rebase_timeseries(arr.to_numpy(), refs)
         return xr.DataArray(out, coords=arr.coords, dims=arr.dims)
 
-    rebased_da = da.map_blocks(process_block)
+    rebased_da = da_disp.map_blocks(process_block)
     # Add initial reference epoch of zeros, and rechunk
     rebased_da = xr.concat(
         [xr.full_like(rebased_da[0], 0), rebased_da],
@@ -278,7 +278,7 @@ class FitConfig:
     poly_degree: int = 1  # 1 = velocity
     seasonal: Literal["none", "annual", "annual+semi"] = "annual"
     temporal_coherence_threshold: float | None = None
-    backend: Literal["jax", "numpy"] = "jax"
+    backend: Literal["jax", "numpy"] = "numpy"
     reference_index: int = 0  # 0 = first epoch
 
 
@@ -492,6 +492,7 @@ def fit_cli(
 
     dps = DispProductStack.from_file_list(opera_netcdfs)
     ds = xr.open_mfdataset(dps.filenames, chunks={"x": x_chunks, "y": y_chunks})
+    ds = ds.chunk({"time": -1, "y": y_chunks, "x": x_chunks})
     print(ds)
     ds_fit = fit_disp_timeseries(ds, cfg=cfg)
 
