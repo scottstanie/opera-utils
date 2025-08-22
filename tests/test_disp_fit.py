@@ -216,7 +216,7 @@ def test_fit_config_defaults():
     assert cfg.poly_degree == 1
     assert cfg.seasonal == "annual"
     assert cfg.temporal_coherence_threshold is None
-    assert cfg.backend == "jax"
+    assert cfg.backend == "numpy"
     assert cfg.reference_index == 0
 
 
@@ -236,13 +236,6 @@ def test_fit_backends_consistency(backend):
 
     # Should have finite values (at least some)
     assert np.any(np.isfinite(result.velocity.values))
-
-    # except (ImportError, Exception) as e:
-    #     # JAX might not be available or have implementation issues
-    #     if backend == "jax":
-    #         pytest.skip(f"JAX backend not working: {e}")
-    #     else:
-    #         raise
 
 
 def test_fit_with_missing_reference_time():

@@ -48,21 +48,29 @@ def rebase_displacement(ds: xr.Dataset) -> xr.DataArray:
     displacement_var = "displacement"
     reference_time_var = "reference_time"
     da_disp = ds[displacement_var]
+
+    # If no reference time provided, leave as-is
+    if reference_time_var not in ds:
+        return da_disp
+
     refs = ds[reference_time_var].values
 
-    # Make the map_blocks-compatible function to accumulate the displacement
-    def process_block(arr: xr.DataArray) -> xr.DataArray:
-        out = rebase_timeseries(arr.to_numpy(), refs)
+    def _block(arr: xr.DataArray) -> xr.DataArray:
+        # arr is one (time,y,x) block
+        out = rebase_timeseries(np.asarray(arr), refs)
         return xr.DataArray(out, coords=arr.coords, dims=arr.dims)
 
-    rebased_da = da_disp.map_blocks(process_block)
-    # Add initial reference epoch of zeros, and rechunk
-    rebased_da = xr.concat(
-        [xr.full_like(rebased_da[0], 0), rebased_da],
-        dim="time",
-    )
-    # Ensure correct dimension order
-    return rebased_da.transpose("time", "y", "x")
+    # Preserve existing chunking; ensure time chunk = -1 for correct crossover behavior
+    chunks = {"time": -1}
+    if da_disp.chunks:
+        if len(da_disp.chunks) > 1:
+            chunks["y"] = da_disp.chunks[1][0]
+        if len(da_disp.chunks) > 2:
+            chunks["x"] = da_disp.chunks[2][0]
+    else:
+        chunks |= {"y": 1024, "x": 1024}
+
+    return da_disp.chunk(chunks).map_blocks(_block).transpose("time", "y", "x")
 
 
 def datetime_to_float(
@@ -70,7 +78,7 @@ def datetime_to_float(
 ) -> np.ndarray:
     """Convert a sequence of datetime objects to a float representation.
 
-    Output units are in days since the first item in `dates`.
+    Output units are in years since the first item in `dates`.
 
     Parameters
     ----------
@@ -85,11 +93,11 @@ def datetime_to_float(
         The float representation of the datetime objects
 
     """
-    sec_per_day = 60 * 60 * 24
+    sec_per_year = 60 * 60 * 24 * 365.25
     date_arr = np.asarray(dates).astype("datetime64[s]")
     # Reference the 0 to the first date
     date_arr = date_arr - date_arr[reference_index]
-    return date_arr.astype(float) / sec_per_day
+    return date_arr.astype(float) / sec_per_year
 
 
 def build_design_matrix(
@@ -179,10 +187,9 @@ def sincos_to_amplitude_phase(
     return amp, np.mod(phase, period)
 
 
-# Fitting (NumPy default, optional JAX)
 def _fit_block_numpy(
-    A: np.ndarray,  # noqa: N803
-    Y: np.ndarray,  # noqa: N803
+    A: np.ndarray,
+    Y: np.ndarray,
     valid: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Solve (A,b) per pixel with missing data ignored.
@@ -204,26 +211,42 @@ def _fit_block_numpy(
     """
     _T, P = A.shape
     N = Y.shape[1]
-    coeffs = np.full((P, N), np.nan, dtype=np.float64)
-    mse = np.full((N,), np.nan, dtype=np.float64)
 
-    # precompute normal matrix parts for each pixel via masking
-    for j in range(N):
-        m = valid[:, j]
-        nobs = int(m.sum())
-        if nobs < P:
-            continue
-        Aj = A[m]
-        bj = Y[m, j]
-        # stable via lstsq
-        x, resid, rank, _ = np.linalg.lstsq(Aj, bj, rcond=None)
-        coeffs[:, j] = x
-        dof = max(1, nobs - rank)
-        if resid.size:
-            mse[j] = resid.item() / dof
-        else:
-            # compute residuals explicitly if lstsq didn't return aggregate
-            mse[j] = np.sum((Aj @ x - bj) ** 2) / dof
+    w = valid.astype(A.dtype)  # (T,N)
+    nobs = w.sum(axis=0)  # (N,)
+
+    # Mask pixels with too few observations
+    ok = nobs >= P
+    if not np.any(ok):
+        return (np.full((P, N), np.nan), np.full((N,), np.nan))
+
+    # Only process OK pixels to keep arrays smaller
+    w_ok = w[:, ok]  # (T,N_ok)
+    Y_ok = Y[:, ok]  # (T,N_ok)
+
+    Aw = A[:, :, None] * w_ok[:, None, :]  # (T,P,N_ok)
+    AtA = np.einsum("tpn,tqn->pqn", Aw, Aw, optimize=True)  # (P,P,N_ok)
+    Aty = np.einsum("tpn,tn->pn", Aw, Y_ok, optimize=True)  # (P,N_ok)
+
+    # Regularize a tiny bit to stabilize near-singular AtA
+    lam = 1e-8
+    Id = np.eye(P, dtype=A.dtype)[:, :, None]  # (P,P,1)
+    AtA_reg = AtA + lam * Id
+
+    # Batched solve: (P,P,N_ok) x (P,N_ok) -> (P,N_ok)
+    # Use transpose to shape into stacks for numpy's batched solve
+    X_ok = np.linalg.solve(AtA_reg.transpose(2, 0, 1), Aty.T).T  # (P,N_ok)
+
+    # Compute MSE on valid rows only
+    R = (A @ X_ok - Y_ok) * w_ok  # (T,N_ok)
+    dof = np.maximum(1, nobs[ok] - P)  # (N_ok,)
+    mse_ok = (R * R).sum(axis=0) / dof
+
+    # Scatter back into full arrays
+    coeffs = np.full((P, N), np.nan, dtype=A.dtype)
+    mse = np.full((N,), np.nan, dtype=A.dtype)
+    coeffs[:, ok] = X_ok
+    mse[ok] = mse_ok
     return coeffs, mse
 
 
@@ -351,32 +374,6 @@ def fit_disp_timeseries(
             },
         )
         return out
-
-    # template_chunks = {"coefficient": -1}
-    # if disp_c.chunks is not None:
-    #     y_dim_idx = list(disp_c.dims).index("y")
-    #     x_dim_idx = list(disp_c.dims).index("x")
-    #     template_chunks["y"] = disp_c.chunks[y_dim_idx][0]
-    #     template_chunks["x"] = disp_c.chunks[x_dim_idx][0]
-    # else:
-    #     template_chunks.update({"y": 1024, "x": 1024})
-    # template = xr.Dataset(
-    #     {
-    #         "coefficients": (
-    #             ["coefficient", "y", "x"],
-    #             np.full(
-    #                 (len(names), disp.sizes["y"], disp.sizes["x"]),
-    #                 np.nan,
-    #                 dtype=np.float64,
-    #             ),
-    #         ),
-    #         "mse": (
-    #             ["y", "x"],
-    #             np.full((disp.sizes["y"], disp.sizes["x"]), np.nan, dtype=np.float64),
-    #         ),
-    #     },
-    #     coords={"coefficient": names, "y": disp.y, "x": disp.x},
-    # ).chunk(template_chunks)
 
     P = len(names)
     H = disp.sizes["y"]
