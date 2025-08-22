@@ -13,6 +13,7 @@ from math import factorial
 from pathlib import Path
 from typing import Literal
 
+import dask.array as da
 import numpy as np
 import xarray as xr
 
@@ -30,21 +31,13 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-def rebase_displacement(
-    ds: xr.Dataset,
-    displacement_var: str = "displacement",
-    reference_time_var: str = "reference_time",
-) -> xr.DataArray:
+def rebase_displacement(ds: xr.Dataset) -> xr.DataArray:
     """Return a rebased displacement (time,y,x) DataArray.
 
     Parameters
     ----------
     ds : xr.Dataset
         Input dataset with displacement data.
-    displacement_var : str
-        Name of displacement variable.
-    reference_time_var : str
-        Name of reference time variable.
 
     Returns
     -------
@@ -52,25 +45,24 @@ def rebase_displacement(
         Rebased displacement array.
 
     """
+    displacement_var = "displacement"
+    reference_time_var = "reference_time"
     da = ds[displacement_var]
     refs = ds[reference_time_var].values
 
-    # Work in process-friendly chunks (time chunk = -1 so we see all crossovers)
-    chunks = {"time": -1}
-    if da.chunks is not None:
-        if len(da.chunks) > 1:
-            chunks["y"] = da.chunks[1][0]
-        if len(da.chunks) > 2:
-            chunks["x"] = da.chunks[2][0]
-    else:
-        chunks.update({"y": 1024, "x": 1024})
-    da_c = da.chunk(chunks)
+    # Make the map_blocks-compatible function to accumulate the displacement
+    def process_block(arr: xr.DataArray) -> xr.DataArray:
+        out = rebase_timeseries(arr.to_numpy(), refs)
+        return xr.DataArray(out, coords=arr.coords, dims=arr.dims)
 
-    def _block(arr: xr.DataArray) -> xr.DataArray:
-        data = rebase_timeseries(arr.data, refs)
-        return xr.DataArray(data, coords=arr.coords, dims=arr.dims)
-
-    return da_c.map_blocks(_block)
+    rebased_da = da.map_blocks(process_block)
+    # Add initial reference epoch of zeros, and rechunk
+    rebased_da = xr.concat(
+        [xr.full_like(rebased_da[0], 0), rebased_da],
+        dim="time",
+    )
+    # Ensure correct dimension order
+    return rebased_da.transpose("time", "y", "x")
 
 
 def datetime_to_float(
@@ -297,9 +289,7 @@ def fit_disp_timeseries(
     ds: xr.Dataset,
     *,
     cfg: FitConfig = DEFAULT_CONFIG,
-    displacement_var: str = "displacement",
-    reference_time_var: str = "reference_time",
-    temporal_coherence_var: str = "temporal_coherence",
+    chunks: tuple[int, int] = (512, 512),
 ) -> xr.Dataset:
     """Fit velocity + seasonal (+ up to cubic) over a DISP stack.
 
@@ -309,12 +299,8 @@ def fit_disp_timeseries(
         Input DISP dataset.
     cfg : FitConfig
         Fitting configuration.
-    displacement_var : str
-        Name of displacement variable.
-    reference_time_var : str
-        Name of reference time variable.
-    temporal_coherence_var : str
-        Name of temporal coherence variable.
+    chunks : tuple[int, int]
+        Size of spatial blocks to process at a time
 
     Returns
     -------
@@ -323,14 +309,11 @@ def fit_disp_timeseries(
 
     """
     # 1) Rebase moving references (lazy)
-    if reference_time_var in ds:
-        disp = rebase_displacement(ds, displacement_var, reference_time_var)
-    else:
-        disp = ds[displacement_var]
+    disp = rebase_displacement(ds)
 
     # 2) Apply temporal coherence threshold if requested
-    if cfg.temporal_coherence_threshold is not None and temporal_coherence_var in ds:
-        tc = ds[temporal_coherence_var]
+    if cfg.temporal_coherence_threshold is not None:
+        tc = ds["temporal_coherence"]
         disp = disp.where(tc >= cfg.temporal_coherence_threshold)
 
     # 3) Design matrix
@@ -342,15 +325,8 @@ def fit_disp_timeseries(
     )
 
     # 4) Chunked solve
-    chunks = {"time": -1}
-    if disp.chunks is not None:
-        if len(disp.chunks) > 1:
-            chunks["y"] = disp.chunks[1][0]
-        if len(disp.chunks) > 2:
-            chunks["x"] = disp.chunks[2][0]
-    else:
-        chunks.update({"y": 1024, "x": 1024})
-    disp_c = disp.chunk(chunks)
+    chunk_dict = {"time": -1, "y": chunks[0], "x": chunks[1]}
+    disp_c = disp.chunk(chunk_dict)
 
     def _solve_block(arr: xr.DataArray) -> xr.Dataset:
         T, H, W = arr.shape
@@ -376,32 +352,63 @@ def fit_disp_timeseries(
         )
         return out
 
+    # template_chunks = {"coefficient": -1}
+    # if disp_c.chunks is not None:
+    #     y_dim_idx = list(disp_c.dims).index("y")
+    #     x_dim_idx = list(disp_c.dims).index("x")
+    #     template_chunks["y"] = disp_c.chunks[y_dim_idx][0]
+    #     template_chunks["x"] = disp_c.chunks[x_dim_idx][0]
+    # else:
+    #     template_chunks.update({"y": 1024, "x": 1024})
+    # template = xr.Dataset(
+    #     {
+    #         "coefficients": (
+    #             ["coefficient", "y", "x"],
+    #             np.full(
+    #                 (len(names), disp.sizes["y"], disp.sizes["x"]),
+    #                 np.nan,
+    #                 dtype=np.float64,
+    #             ),
+    #         ),
+    #         "mse": (
+    #             ["y", "x"],
+    #             np.full((disp.sizes["y"], disp.sizes["x"]), np.nan, dtype=np.float64),
+    #         ),
+    #     },
+    #     coords={"coefficient": names, "y": disp.y, "x": disp.x},
+    # ).chunk(template_chunks)
+
+    P = len(names)
+    H = disp.sizes["y"]
+    W = disp.sizes["x"]
+
     template_chunks = {"coefficient": -1}
-    if disp_c.chunks is not None:
-        y_dim_idx = list(disp_c.dims).index("y")
-        x_dim_idx = list(disp_c.dims).index("x")
-        template_chunks["y"] = disp_c.chunks[y_dim_idx][0]
-        template_chunks["x"] = disp_c.chunks[x_dim_idx][0]
+    if disp.chunks is not None:
+        y_dim_idx = list(disp.dims).index("y")
+        x_dim_idx = list(disp.dims).index("x")
+        template_chunks["y"] = disp.chunks[y_dim_idx][0]
+        template_chunks["x"] = disp.chunks[x_dim_idx][0]
     else:
         template_chunks.update({"y": 1024, "x": 1024})
 
+    coeffs_da = da.empty(
+        (P, H, W),
+        dtype="float64",
+        chunks=(P, template_chunks["y"], template_chunks["x"]),
+    )
+    mse_da = da.empty(
+        (H, W),
+        dtype="float64",
+        chunks=(template_chunks["y"], template_chunks["x"]),
+    )
+
     template = xr.Dataset(
         {
-            "coefficients": (
-                ["coefficient", "y", "x"],
-                np.full(
-                    (len(names), disp.sizes["y"], disp.sizes["x"]),
-                    np.nan,
-                    dtype=np.float64,
-                ),
-            ),
-            "mse": (
-                ["y", "x"],
-                np.full((disp.sizes["y"], disp.sizes["x"]), np.nan, dtype=np.float64),
-            ),
+            "coefficients": (["coefficient", "y", "x"], coeffs_da),
+            "mse": (["y", "x"], mse_da),
         },
         coords={"coefficient": names, "y": disp.y, "x": disp.x},
-    ).chunk(template_chunks)
+    )
 
     ds_fit = xr.map_blocks(_solve_block, disp_c, template=template)
 
@@ -485,6 +492,7 @@ def fit_cli(
 
     dps = DispProductStack.from_file_list(opera_netcdfs)
     ds = xr.open_mfdataset(dps.filenames, chunks={"x": x_chunks, "y": y_chunks})
+    print(ds)
     ds_fit = fit_disp_timeseries(ds, cfg=cfg)
 
     output_dir = output_dir.with_suffix(output_dir.suffix or ".zarr")
