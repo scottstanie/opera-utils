@@ -393,12 +393,12 @@ def fit_disp_timeseries(
 
     coeffs_da = da.empty(
         (P, H, W),
-        dtype="float64",
+        dtype="float32",
         chunks=(P, template_chunks["y"], template_chunks["x"]),
     )
     mse_da = da.empty(
         (H, W),
-        dtype="float64",
+        dtype="float32",
         chunks=(template_chunks["y"], template_chunks["x"]),
     )
 
