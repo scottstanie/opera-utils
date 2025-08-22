@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime
 import itertools
 from collections.abc import Iterable, Mapping, Sequence
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -155,17 +156,19 @@ def _get_netcdf_encoding(
     ds: xr.Dataset,
     chunks: tuple[int, int, int],
     compression_level: int = 6,
-    data_vars: Sequence[str] = [],
+    data_vars: list[str] | None = None,
 ) -> dict:
+    if data_vars is None:
+        data_vars = []
     encoding = {}
     comp = {"zlib": True, "complevel": compression_level, "chunksizes": chunks}
     if not data_vars:
         data_vars = list(ds.data_vars)
-    encoding = {var: comp.copy() for var in data_vars if ds[var].ndim >= 2}
+    encoding = {var: deepcopy(comp) for var in data_vars if ds[var].ndim >= 2}
     for var in data_vars:
         if ds[var].ndim < 2:
             continue
-        encoding[var] = comp
+        encoding[var] = deepcopy(comp)
         if ds[var].ndim == 2:
             encoding[var]["chunksizes"] = chunks[-2:]
     return encoding
