@@ -437,6 +437,8 @@ def fit_disp_timeseries(
         reference_index=cfg.reference_index,
     )
 
+    # run once to compile
+    invert_stack(np.random.randn(4, 2), np.random.randn(4, 4, 4), weights=None)
     # 4) Chunked solve
     chunk_dict = {"time": -1, "y": chunks[0], "x": chunks[1]}
     disp_c = disp.chunk(chunk_dict)
