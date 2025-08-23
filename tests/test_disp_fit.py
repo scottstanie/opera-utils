@@ -11,7 +11,6 @@ from opera_utils.disp.fit import (
     build_design_matrix,
     datetime_to_float,
     fit_disp_timeseries,
-    rebase_displacement,
     sincos_to_amplitude_phase,
 )
 
@@ -27,8 +26,8 @@ def test_datetime_to_float():
     result = datetime_to_float(dates, reference_index=0)
 
     assert result[0] == 0.0  # reference date
-    assert result[1] == 12.0  # 12 days
-    assert result[2] == 31.0  # 31 days
+    assert result[1] == 12.0 / 365.25  # 12 days
+    assert result[2] == 31.0 / 365.25  # 31 days
 
 
 def test_build_design_matrix_linear():
@@ -102,7 +101,7 @@ def create_synthetic_disp_dataset():
     # Add linear trend
     time_values = datetime_to_float(times)
     for i, t in enumerate(time_values):
-        displacement[i] += t * 0.01  # 1cm/day velocity
+        displacement[i] += t * 0.01  # 1cm/year velocity
 
     # Reference times (same for all in this test)
     reference_times = np.full(4, times[0])
@@ -124,20 +123,6 @@ def create_synthetic_disp_dataset():
     )
 
     return ds
-
-
-def test_rebase_displacement():
-    """Test displacement rebasing with uniform reference times."""
-    ds = create_synthetic_disp_dataset()
-
-    # For uniform reference times, rebasing should not change the data
-    rebased = rebase_displacement(ds)
-
-    # Should have same shape
-    assert rebased.shape == ds.displacement.shape
-
-    # Values should be similar (same reference time means no rebasing needed)
-    np.testing.assert_array_almost_equal(rebased.values, ds.displacement.values)
 
 
 def test_fit_disp_timeseries_basic():

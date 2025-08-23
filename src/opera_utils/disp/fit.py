@@ -187,67 +187,44 @@ def sincos_to_amplitude_phase(
     return amp, np.mod(phase, period)
 
 
-def _fit_block_numpy(
-    A: np.ndarray,
-    Y: np.ndarray,
-    valid: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Solve (A,b) per pixel with missing data ignored.
+def _fit_block_numpy(A, B, valid):
+    """Solves least squares problem subject to missing data in the right hand side.
 
     Parameters
     ----------
-    A : np.ndarray
-        Design matrix, shape (T, P).
-    Y : np.ndarray
-        Observations, shape (T, N).
-    valid : np.ndarray
-        Valid data mask, shape (T, N).
+    A : ndarray
+        m x n system matrix.
+    B : ndarray
+        m x k matrix representing the k right hand side data vectors of size m.
+    valid : ndarray
+        m x k boolean matrix of missing data (`False` indicate missing values)
 
     Returns
     -------
-    tuple[np.ndarray, np.ndarray]
-        Coefficients (P, N) and MSE (N,).
+    X : ndarray
+        n x k matrix that minimizes norm(valid*(AX - B))
+    residuals : np.array 1D
+        Sums of (k,) squared residuals: squared Euclidean 2-norm for `b - A @ x`
+
+    Reference
+    ---------
+    http://alexhwilliams.info/itsneuronalblog/2018/02/26/censored-lstsq/
 
     """
-    _T, P = A.shape
-    N = Y.shape[1]
+    import jax.numpy as np  # noqa: PLC0415
 
-    w = valid.astype(A.dtype)  # (T,N)
-    nobs = w.sum(axis=0)  # (N,)
+    # if B is a vector, simply drop out corresponding rows in A
+    if B.ndim == 1 or B.shape[1] == 1:
+        return np.linalg.lstsq(A[valid], B[valid])[0]
 
-    # Mask pixels with too few observations
-    ok = nobs >= P
-    if not np.any(ok):
-        return (np.full((P, N), np.nan), np.full((N,), np.nan))
-
-    # Only process OK pixels to keep arrays smaller
-    w_ok = w[:, ok]  # (T,N_ok)
-    Y_ok = Y[:, ok]  # (T,N_ok)
-
-    Aw = A[:, :, None] * w_ok[:, None, :]  # (T,P,N_ok)
-    AtA = np.einsum("tpn,tqn->pqn", Aw, Aw, optimize=True)  # (P,P,N_ok)
-    Aty = np.einsum("tpn,tn->pn", Aw, Y_ok, optimize=True)  # (P,N_ok)
-
-    # Regularize a tiny bit to stabilize near-singular AtA
-    lam = 1e-8
-    Id = np.eye(P, dtype=A.dtype)[:, :, None]  # (P,P,1)
-    AtA_reg = AtA + lam * Id
-
-    # Batched solve: (P,P,N_ok) x (P,N_ok) -> (P,N_ok)
-    # Use transpose to shape into stacks for numpy's batched solve
-    X_ok = np.linalg.solve(AtA_reg.transpose(2, 0, 1), Aty.T).T  # (P,N_ok)
-
-    # Compute MSE on valid rows only
-    R = (A @ X_ok - Y_ok) * w_ok  # (T,N_ok)
-    dof = np.maximum(1, nobs[ok] - P)  # (N_ok,)
-    mse_ok = (R * R).sum(axis=0) / dof
-
-    # Scatter back into full arrays
-    coeffs = np.full((P, N), np.nan, dtype=A.dtype)
-    mse = np.full((N,), np.nan, dtype=A.dtype)
-    coeffs[:, ok] = X_ok
-    mse[ok] = mse_ok
-    return coeffs, mse
+    # else solve via tensor representation
+    rhs = np.dot(A.T, valid * B).T[:, :, None]  # k x n x 1 tensor
+    T = np.matmul(
+        A.T[None, :, :], valid.T[:, :, None] * A[None, :, :]
+    )  # k x n x n tensor
+    x = np.squeeze(np.linalg.solve(T, rhs)).T  # transpose to get n x k
+    residuals = np.linalg.norm(A @ x - (B * valid.astype(int)), axis=0)
+    return x, residuals
 
 
 def _maybe_jax_fit(
