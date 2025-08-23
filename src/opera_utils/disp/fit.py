@@ -162,7 +162,7 @@ def build_design_matrix(
     return A, names
 
 
-def sincos_to_amplitude_phase(
+def sin_cos_to_amplitude_phase(
     a_cos: np.ndarray, a_sin: np.ndarray, period: float
 ) -> tuple[np.ndarray, np.ndarray]:
     """Convert sin/cos coefficients to amplitude and phase.
@@ -285,6 +285,119 @@ class FitConfig:
 DEFAULT_CONFIG = FitConfig()
 
 
+import jax.numpy as jnp
+from jax import Array, jit, vmap
+
+
+@jit
+def weighted_lstsq_single(
+    A: Array,
+    b: Array,
+    weights: Array,
+) -> Array:
+    r"""Perform weighted least squares for one data vector.
+
+    Minimizes the weighted 2-norm of the residual vector:
+
+    \[
+        || b - A x ||^2_W
+    \]
+
+    where \(W\) is a diagonal matrix of weights.
+
+    Parameters
+    ----------
+    A : Array
+        Incidence matrix of shape (n_ifgs, n_sar_dates - 1)
+    b : Array, 1D
+        The phase differences between the ifg pairs
+    weights : Array, 1D, optional
+        The weights for each element of `b`.
+
+    Returns
+    -------
+    x : np.array 1D
+        The estimated phase for each SAR acquisition
+    residuals : np.array 1D
+        Sums of squared residuals: Squared Euclidean 2-norm for `b - A @ x`
+        For a 1D `b`, this is a scalar.
+
+    """
+    # scale both A and b by sqrt so we are minimizing
+    sqrt_weights = jnp.sqrt(weights)
+    # Multiply each data point by sqrt(weight)
+    b_scaled = b * sqrt_weights
+    # Multiply each row by sqrt(weight)
+    A_scaled = A * sqrt_weights[:, None]
+
+    # Run the weighted least squares
+    x, residuals, _rank, _sing_vals = jnp.linalg.lstsq(A_scaled, b_scaled)
+    # TODO: do we need special handling?
+    # if rank < A.shape[1]:
+    #     # logger.warning("Rank deficient solution")
+
+    return x, residuals.ravel()
+
+
+@jit
+def invert_stack(
+    A: Array,
+    dphi: Array,
+    weights: Array | None = None,
+) -> tuple[Array, Array]:
+    """Solve the SBAS problem for a stack of unwrapped phase differences.
+
+    Parameters
+    ----------
+    A : Array
+        Incidence matrix of shape (n_ifgs, n_sar_dates - 1)
+    dphi : Array
+        The phase differences between the ifg pairs, shape=(n_ifgs, n_rows, n_cols)
+    weights : Array, optional
+        The weights for each element of `dphi`.
+        Same shape as `dphi`.
+        If not provided, all weights are set to 1 (ordinary least squares).
+
+    Returns
+    -------
+    phi : np.array 3D
+        The estimated phase for each SAR acquisition
+        Shape is (n_sar_dates - 1, n_rows, n_cols)
+    residuals : np.array 2D
+        Sums of squared residuals: Squared Euclidean 2-norm for `dphi - A @ x`
+        Shape is (n_rows, n_cols)
+
+    Notes
+    -----
+    To mask out data points of a pixel, the weight can be set to 0.
+    When `A` remains full rank, setting the weight to zero is the same as removing
+    the entry from the data vector and the corresponding row from `A`.
+
+    """
+    n_ifgs, n_rows, n_cols = dphi.shape
+
+    if weights is None:
+        # Can use ordinary least squares with no weights
+        # Reshape to be size (M, K) instead of 3D
+        b = dphi.reshape(n_ifgs, -1)
+        phase_cols, residuals_cols, _, _ = jnp.linalg.lstsq(A, b)
+        # Reshape the phase and residuals to be 3D
+        phase = phase_cols.reshape(-1, n_rows, n_cols)
+        residuals = residuals_cols.reshape(n_rows, n_cols)
+    else:
+        # vectorize the solve function to work on 2D and 3D arrays
+        # We are not vectorizing over the A matrix, only the dphi vector
+        # Solve 2d shapes: (nrows, n_ifgs) -> (nrows, n_sar_dates)
+        invert_2d = vmap(weighted_lstsq_single, in_axes=(None, 1, 1), out_axes=(1, 1))
+        # Solve 3d shapes: (nrows, ncols, n_ifgs) -> (nrows, ncols, n_sar_dates)
+        invert_3d = vmap(invert_2d, in_axes=(None, 2, 2), out_axes=(2, 2))
+        phase, residuals = invert_3d(A, dphi, weights)
+        # Reshape the residuals to be 2D
+        residuals = residuals[0]
+
+    return phase, residuals
+
+
 def fit_disp_timeseries(
     ds: xr.Dataset,
     *,
@@ -329,15 +442,18 @@ def fit_disp_timeseries(
     disp_c = disp.chunk(chunk_dict)
 
     def _solve_block(arr: xr.DataArray) -> xr.Dataset:
-        T, H, W = arr.shape
+        _T, H, W = arr.shape
         data = arr.data  # dask array -> materialized inside block
-        # to numpy
-        Y = np.asarray(data).reshape(T, H * W)
-        valid = np.isfinite(Y)
-        coeffs, mse = _maybe_jax_fit(A, Y, valid, use_jax=(cfg.backend == "jax"))
-        P = coeffs.shape[0]
-        coeffs = coeffs.reshape(P, H, W)
-        mse = mse.reshape(H, W)
+        # weights = ... # TODO: how do you get map_blocks to take 2 dataarrays
+        coeffs, mse = invert_stack(A, data, weights=None)
+
+        # # to numpy
+        # Y = np.asarray(data).reshape(T, H * W)
+        # valid = np.isfinite(Y)
+        # coeffs, mse = _maybe_jax_fit(A, Y, valid, use_jax=(cfg.backend == "jax"))
+        # P = coeffs.shape[0]
+        # coeffs = coeffs.reshape(P, H, W)
+        # mse = mse.reshape(H, W)
 
         out = xr.Dataset(
             {
@@ -410,14 +526,14 @@ def fit_disp_timeseries(
     if "annual_sin" in names and "annual_cos" in names:
         A_cos = ds_fit["coefficients"].sel(coefficient="annual_cos")
         A_sin = ds_fit["coefficients"].sel(coefficient="annual_sin")
-        amp, ph = sincos_to_amplitude_phase(A_cos, A_sin, period=1.0)
+        amp, ph = sin_cos_to_amplitude_phase(A_cos, A_sin, period=1.0)
         ds_fit["annual_amplitude"] = amp
         ds_fit["annual_phase"] = ph
 
     if "semiannual_sin" in names and "semiannual_cos" in names:
         A_cos = ds_fit["coefficients"].sel(coefficient="semiannual_cos")
         A_sin = ds_fit["coefficients"].sel(coefficient="semiannual_sin")
-        amp, ph = sincos_to_amplitude_phase(A_cos, A_sin, period=0.5)
+        amp, ph = sin_cos_to_amplitude_phase(A_cos, A_sin, period=0.5)
         ds_fit["semiannual_amplitude"] = amp
         ds_fit["semiannual_phase"] = ph
 
