@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-from ._utils import _clamp_chunk_dict
+from opera_utils.disp._utils import _clamp_chunk_dict
 
 logger = logging.getLogger("opera_utils")
 
@@ -29,9 +29,9 @@ class NaNPolicy(str, Enum):
 
 
 def create_rebased_displacement(
-    da_displacement: xr.DataArray,
-    reference_datetimes: Sequence[datetime | pd.DatetimeIndex],
-    process_chunk_size: tuple[int, int] = (512, 512),
+    ds: xr.DataArray,
+    # reference_datetimes: Sequence[datetime | pd.DatetimeIndex],
+    process_chunk_size: tuple[int, int] = (1024, 1024),
     add_reference_time: bool = False,
     nan_policy: str | NaNPolicy = NaNPolicy.propagate,
 ) -> xr.DataArray:
@@ -74,12 +74,18 @@ def create_rebased_displacement(
         "y": process_chunk_size[0],
         "x": process_chunk_size[1],
     }
+    da_displacement: xr.DataArray = ds["displacement"]
     process_chunks = _clamp_chunk_dict(process_chunks, da_displacement.shape)
+    reference_datetimes = ds.reference_time.to_numpy()
+    secondary_datetimes = ds.time.to_numpy()
 
     # Make the map_blocks-compatible function to accumulate the displacement
     def process_block(arr: xr.DataArray) -> xr.DataArray:
         out = rebase_timeseries(
-            arr.to_numpy(), reference_datetimes, nan_policy=nan_policy
+            arr.to_numpy(),
+            reference_datetimes,
+            secondary_datetimes,
+            nan_policy=nan_policy,
         )
         return xr.DataArray(out, coords=arr.coords, dims=arr.dims)
 
@@ -98,7 +104,7 @@ def create_rebased_displacement(
     return rebased_da
 
 
-def rebase_timeseries(
+def rebase_timeseries_old(
     raw_data: np.ndarray,
     reference_dates: Sequence[datetime],
     nan_policy: str | NaNPolicy = NaNPolicy.propagate,
@@ -170,3 +176,127 @@ def rebase_timeseries(
         out_layer[:] = current_displacement + cumulative_offset
 
     return output
+
+
+def rebase_timeseries(
+    raw_data: np.ndarray,
+    reference_dates: list[datetime] | pd.DatetimeIndex,
+    secondary_dates: list[datetime] | pd.DatetimeIndex,
+    nan_policy: str | NaNPolicy = NaNPolicy.propagate,
+) -> np.ndarray:
+    """Rebase to the first reference by composing true crossovers, using fuzzy
+    matching between reference and secondary datetimes (±crossover_tolerance).
+
+    raw_data: (T, Y, X)
+    reference_dates[t]: reference of epoch t (len T)
+    secondary_dates[t]: secondary (time) of epoch t (len T)
+    """
+    T = raw_data.shape[0]
+    if T == 0:
+        return raw_data.copy()
+
+    # Normalize to numpy int64 ns for fast matching
+    ref_ns = reference_dates.astype("datetime64[D]")
+    sec_ns = secondary_dates.astype("datetime64[D]")
+    if len(set(ref_ns)) == 1:
+        return raw_data.copy()
+
+    # Build a nearest-neighbor matcher: for each ref r, find index k with sec≈r
+    # within tolerance; otherwise return -1.
+    sec_sorted_idx = np.argsort(sec_ns)
+    sec_sorted = sec_ns[sec_sorted_idx]
+
+    def match_secondary_index(r_ns: np.int64) -> int:
+        pos = np.searchsorted(sec_sorted, r_ns)
+        candidates = []
+        if pos < sec_sorted.size:
+            candidates.append(pos)
+        if pos > 0:
+            candidates.append(pos - 1)
+        if not candidates:
+            return -1
+        # choose nearest
+        cand = min(candidates, key=lambda i: abs(sec_sorted[i] - r_ns))
+        if sec_sorted[cand] == r_ns:
+            return int(sec_sorted_idx[cand])
+        return -1
+
+    # Unique references in temporal order, keep first ref as r0
+    refs_unique, _inv = np.unique(ref_ns, return_inverse=True)
+    r0_ns = refs_unique[0]
+
+    # Map each crossover (p,r) to an index k in raw_data via fuzzy match on r
+    # (We’ll look up (p,r) existence by checking whether there exists a t with
+    # ref_ns[t]==p and sec_ns[t]≈r within tol.)
+    # For fast lookup, collect all indices per reference p:
+    idx_by_ref: dict[np.int64, np.ndarray] = {}
+    for p in refs_unique:
+        idx_by_ref[p] = np.nonzero(ref_ns == p)[0]
+
+    def edge_index(p_ns: np.int64, r_ns: np.int64) -> int:
+        """Return t where ref==p and sec≈r (within tol), else -1."""
+        k_r = match_secondary_index(r_ns)
+        if k_r == -1:
+            return -1
+        # Need t with ref==p and same secondary index k_r
+        # Compare by secondary value (ns), not position, because order differs.
+        target_sec = sec_ns[k_r]
+        t_candidates = idx_by_ref[p_ns]
+        # find any t with sec_ns[t] within tol of target_sec
+        if t_candidates.size == 0:
+            return -1
+        # Check nearest among those t_candidates
+        diffs = np.abs(sec_ns[t_candidates] - target_sec)
+        t_local = t_candidates[np.argmin(diffs)]
+        if sec_ns[t_local] == target_sec:
+            return int(t_local)
+        return -1
+
+    # Build per-reference offset images O(r) by dynamic programming.
+    offsets: dict[np.int64, np.ndarray] = {
+        r0_ns: np.zeros(raw_data.shape[1:], dtype=raw_data.dtype)
+    }
+
+    def _accum(dst: np.ndarray, src: np.ndarray) -> np.ndarray:
+        if nan_policy == NaNPolicy.omit:
+            src = np.nan_to_num(src, copy=False)
+        return dst + src
+
+    for r_ns in refs_unique[1:]:
+        # Prefer direct (r0, r)
+        k = edge_index(r0_ns, r_ns)
+        if k != -1:
+            offsets[r_ns] = _accum(offsets[r0_ns], raw_data[k])
+            continue
+
+        # Otherwise chain via a prior p<r with known O(p) and available (p,r)
+        prior = refs_unique[refs_unique < r_ns]
+        # try latest first (works well for sliding windows)
+        found = False
+        for p_ns in prior[::-1]:
+            if p_ns not in offsets:
+                continue
+            k = edge_index(p_ns, r_ns)
+            if k != -1:
+                offsets[r_ns] = _accum(offsets[p_ns], raw_data[k])
+                found = True
+                break
+        if not found:
+            # As a last resort, if r has no inbound edge (rare), carry forward O of the nearest prior ref
+            # so the series stays continuous (optional: raise instead).
+            if prior.size > 0 and prior[-1] in offsets:
+                offsets[r_ns] = offsets[prior[-1]].copy()
+            else:
+                msg = (
+                    "Cannot construct offset for reference "
+                    f"{pd.to_datetime(r_ns)}: no crossover within tolerance."
+                )
+                raise ValueError(
+                    msg
+                )
+
+    # Apply per-epoch
+    out = np.empty_like(raw_data)
+    for t in range(T):
+        out[t] = raw_data[t] + offsets[ref_ns[t]]
+    return out
