@@ -415,6 +415,7 @@ def fit_disp_timeseries(
     cfg: FitConfig = DEFAULT_CONFIG,
     chunks: tuple[int, int] = (512, 512),
     ref_point: tuple[int, int] | None = None,
+    skip_reference: bool = False,
     rebase: bool = True,
 ) -> xr.Dataset:
     """Fit velocity + seasonal (+ up to cubic) over a DISP stack.
@@ -446,7 +447,7 @@ def fit_disp_timeseries(
         disp = disp.where(tc >= cfg.temporal_coherence_threshold)
 
     ref = np.zeros((disp.shape[0], 1, 1))
-    if ref_point is None:
+    if not skip_reference and ref_point is None:
         tc = ds["temporal_coherence"]
         tc0 = tc[-1].to_numpy()
         _vals, idxs = _topk(tc0, k=20)
