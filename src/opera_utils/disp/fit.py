@@ -17,6 +17,8 @@ import dask.array as da
 import numpy as np
 import xarray as xr
 
+from opera_utils._dates import get_dates
+
 from ._product import DispProductStack
 from ._rebase import rebase_timeseries
 
@@ -73,6 +75,9 @@ def rebase_displacement(ds: xr.Dataset) -> xr.DataArray:
     return da_disp.chunk(chunks).map_blocks(_block).transpose("time", "y", "x")
 
 
+polynomial_names = ["constant", "velocity", "quadratic", "cubic"]
+
+
 def datetime_to_float(
     dates: Sequence[date | datetime], reference_index: int = 0
 ) -> np.ndarray:
@@ -105,7 +110,8 @@ def build_design_matrix(
     poly_degree: int = 1,
     seasonal: Literal["none", "annual", "annual+semi"] = "annual",
     reference_index: int = 0,
-) -> tuple[np.ndarray, list[str]]:
+    unit_base: str = "unknown",
+) -> tuple[np.ndarray, list[str], list[str]]:
     """Build design matrix for timeseries fitting.
 
     Parameters
@@ -129,16 +135,20 @@ def build_design_matrix(
 
     cols = []
     names: list[str] = []
+    units: list[str] = []
 
     # Poly terms: constant, linear (velocity), quadratic, cubic
     # factorial normalization for conditioning
-    for i, name in enumerate(
-        ["constant", "linear_trend", "quadratic", "cubic"][: poly_degree + 1]
-    ):
+    for i, name in enumerate(polynomial_names[: poly_degree + 1]):
         if i == 0:
             cols.append(np.ones_like(t))
+            units.append(f"{unit_base}")
         else:
             cols.append((t**i) / factorial(i))
+            denom = "years"
+            if i > 1:
+                denom += f"^{i}"
+            units.append(f"{unit_base} / {denom}")
         names.append(name)
 
     # Seasonal terms: sin/cos pairs
@@ -156,10 +166,11 @@ def build_design_matrix(
             names += ["semiannual_sin", "semiannual_cos"]
         else:
             names += [f"period_{P:.3f}y_sin", f"period_{P:.3f}y_cos"]
-        cols += [np.sin(w * t), np.cos(w * t)]
+        cols.extend([np.sin(w * t), np.cos(w * t)])
+        units.extend([unit_base, unit_base])
 
     A = np.column_stack(cols).astype(np.float64, copy=False)
-    return A, names
+    return A, names, units
 
 
 def sin_cos_to_amplitude_phase(
@@ -403,6 +414,8 @@ def fit_disp_timeseries(
     *,
     cfg: FitConfig = DEFAULT_CONFIG,
     chunks: tuple[int, int] = (512, 512),
+    ref_point: tuple[int, int] | None = None,
+    rebase: bool = True,
 ) -> xr.Dataset:
     """Fit velocity + seasonal (+ up to cubic) over a DISP stack.
 
@@ -414,6 +427,9 @@ def fit_disp_timeseries(
         Fitting configuration.
     chunks : tuple[int, int]
         Size of spatial blocks to process at a time
+    ref_point : tuple[int, int]
+        (row, column) of the spatial reference point to use before fitting.
+        If None, takes a high coherence point
 
     Returns
     -------
@@ -422,19 +438,36 @@ def fit_disp_timeseries(
 
     """
     # 1) Rebase moving references (lazy)
-    disp = rebase_displacement(ds)
+    disp = rebase_displacement(ds) if rebase else ds.displacement
 
     # 2) Apply temporal coherence threshold if requested
     if cfg.temporal_coherence_threshold is not None:
         tc = ds["temporal_coherence"]
         disp = disp.where(tc >= cfg.temporal_coherence_threshold)
 
+    ref = np.zeros((disp.shape[0], 1, 1))
+    if ref_point is None:
+        tc = ds["temporal_coherence"]
+        tc0 = tc[-1].to_numpy()
+        _vals, idxs = _topk(tc0, k=20)
+        for idx in idxs:
+            test_row, test_col = np.unravel_index(idx, tc0.shape)
+            test_ref = disp[:, test_row, test_col]
+            if np.isnan(test_ref).sum() == 0:
+                ref = np.asarray(test_ref)[:, None, None]
+                break
+        else:
+            msg = "Could not find spatial reference with all valid values."
+            raise ValueError(msg)
+
     # 3) Design matrix
-    A, names = build_design_matrix(
+    unit_base = disp.units or "unknown"
+    A, names, units = build_design_matrix(
         disp.time.values,
         poly_degree=cfg.poly_degree,
         seasonal=cfg.seasonal,
         reference_index=cfg.reference_index,
+        unit_base=unit_base,
     )
 
     # run once to compile
@@ -442,10 +475,13 @@ def fit_disp_timeseries(
     # 4) Chunked solve
     chunk_dict = {"time": -1, "y": chunks[0], "x": chunks[1]}
     disp_c = disp.chunk(chunk_dict)
+    num_blocks = np.prod(list(map(len, disp_c.chunks)))
+    print(f"{num_blocks = }")
 
-    def _solve_block(arr: xr.DataArray) -> xr.Dataset:
+    def _solve_block(arr: xr.DataArray, tt=None) -> xr.Dataset:
         _T, H, W = arr.shape
-        data = arr.data  # dask array -> materialized inside block
+        data = arr.data - ref
+
         # weights = ... # TODO: how do you get map_blocks to take 2 dataarrays
         coeffs, mse = invert_stack(A, data, weights=None)
 
@@ -502,15 +538,8 @@ def fit_disp_timeseries(
         coords={"coefficient": names, "y": disp.y, "x": disp.x},
     )
 
+    print(f"{disp_c = }")
     ds_fit = xr.map_blocks(_solve_block, disp_c, template=template)
-
-    # 5) Derived seasonal diagnostics
-    def _maybe(name: str) -> xr.DataArray | None:
-        return (
-            ds_fit["coefficients"].sel(coefficient=name, drop=True)
-            if name in names
-            else None
-        )
 
     ds_fit = ds_fit.assign_attrs(
         model=(
@@ -519,34 +548,43 @@ def fit_disp_timeseries(
         )
     )
 
-    # Convenience layers
-    # velocity (linear term) = 1st-order coefficient scaled by factorial(1)=1
-    vel = _maybe("linear_trend")
-    if vel is not None:
-        ds_fit["velocity"] = vel
+    # Extract polynomial layers
+    for i, (name, unit) in enumerate(zip(polynomial_names, units)):
+        if name in names:
+            ds_fit[name] = ds_fit["coefficients"].sel(
+                coefficient=name, drop=True
+            ) * factorial(i)
+            ds_fit[name].attrs["units"] = unit
 
+    # Derived seasonal diagnostics, conveting sin/cosine coefficients to amplitude/phase
     if "annual_sin" in names and "annual_cos" in names:
         A_cos = ds_fit["coefficients"].sel(coefficient="annual_cos")
         A_sin = ds_fit["coefficients"].sel(coefficient="annual_sin")
         amp, ph = sin_cos_to_amplitude_phase(A_cos, A_sin, period=1.0)
         ds_fit["annual_amplitude"] = amp
+        ds_fit["annual_amplitude"].attrs["units"] = unit_base
         ds_fit["annual_phase"] = ph
+        ds_fit["annual_phase"].attrs["units"] = "cycles"
 
     if "semiannual_sin" in names and "semiannual_cos" in names:
         A_cos = ds_fit["coefficients"].sel(coefficient="semiannual_cos")
         A_sin = ds_fit["coefficients"].sel(coefficient="semiannual_sin")
         amp, ph = sin_cos_to_amplitude_phase(A_cos, A_sin, period=0.5)
         ds_fit["semiannual_amplitude"] = amp
+        ds_fit["annual_amplitude"].attrs["units"] = unit_base
         ds_fit["semiannual_phase"] = ph
+        ds_fit["annual_phase"].attrs["units"] = "cycles"
 
-    return ds_fit
+    # All extraction done: drop duplicated 'coefficients'
+    return ds_fit.drop_dims("coefficient")
 
 
 def fit_cli(
-    opera_netcdfs: Sequence[Path],
+    files: Sequence[Path],
     output_dir: Path,
     *,
-    poly_degree: int = 1,
+    ref_point: tuple[int, int] | None = None,
+    poly_degree: int = 3,
     seasonal: Literal["none", "annual", "annual+semi"] = "annual",
     temporal_coherence_threshold: float | None = None,
     x_chunks: int = 1024,
@@ -557,8 +595,8 @@ def fit_cli(
 
     Parameters
     ----------
-    opera_netcdfs : Sequence[Path]
-        Directory or single NetCDF of OPERA DISP products.
+    files : Sequence[Path]
+        List of OPERA DISP products, or of rebased
     output_dir : Path
         Output Zarr or NetCDF path.
     poly_degree : int
@@ -581,12 +619,41 @@ def fit_cli(
         temporal_coherence_threshold=temporal_coherence_threshold,
         backend=backend,
     )
+    chunks = {"y": y_chunks, "x": x_chunks}
 
-    dps = DispProductStack.from_file_list(opera_netcdfs)
-    ds = xr.open_mfdataset(dps.filenames, chunks={"x": x_chunks, "y": y_chunks})
-    ds = ds.chunk({"time": -1, "y": y_chunks, "x": x_chunks})
+    try:
+        dps = DispProductStack.from_file_list(files)
+        ds = xr.open_mfdataset(dps.filenames, chunks=chunks)
+        rebase = True
+    except Exception as e:
+        import pandas as pd
+
+        print(e)
+
+        def prep(ds: xr.Dataset) -> xr.Dataset:
+            """Preprocess individual dataset when loading with open_mfdataset."""
+            fname = ds.encoding["source"]
+            ref, sec = get_dates(fname, fmt="%Y%m%d")[:2]
+            if len(ds.band) == 1:
+                ds = ds.sel(band=ds.band[0]).drop_vars("band")
+            return ds.expand_dims(
+                time=[pd.to_datetime(sec)], reference_time=[pd.to_datetime(ref)]
+            )
+
+        ds = xr.open_mfdataset(
+            files, preprocess=prep, chunks=chunks, default_name="displacement"
+        )
+        rebase = len(ds.reference_time.values) > 1
+        print(f"{rebase =}")
+        print(ds.reference_time)
+        ds = ds.isel(reference_time=0)
+
+    # SUBSET TEST
+    # ds = ds.isel(x=slice(1024, 2048), y=slice(1024, 2048))
     print(ds)
-    ds_fit = fit_disp_timeseries(ds, cfg=cfg)
+    ds_fit = fit_disp_timeseries(
+        ds, cfg=cfg, ref_point=ref_point, chunks=(y_chunks, x_chunks), rebase=rebase
+    )
 
     output_dir = output_dir.with_suffix(output_dir.suffix or ".zarr")
     if output_dir.suffix == ".zarr":
@@ -595,3 +662,24 @@ def fit_cli(
         ds_fit.to_netcdf(output_dir)
 
     logger.info(f"Wrote {output_dir}")
+
+
+def _topk(array, k: int = 10, axis=-1):
+    # Use np.argpartition is faster than np.argsort, but do not return the values in order
+    # We use array.take because you can specify the axis
+    partitioned_ind = np.argpartition(array, -k, axis=axis).take(
+        indices=range(-k, 0), axis=axis
+    )
+    # We use the newly selected indices to find the score of the top-k values
+    partitioned_scores = np.take_along_axis(array, partitioned_ind, axis=axis)
+
+    ind = partitioned_ind
+    scores = partitioned_scores
+
+    return scores, ind
+
+
+if __name__ == "__main__":
+    import tyro
+
+    tyro.cli(fit_cli)
