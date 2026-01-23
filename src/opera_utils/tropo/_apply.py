@@ -87,12 +87,13 @@ def _height_to_dem_surface(
 def _compute_reference_correction(
     first_cropped: Path,
     dem_path: Path,
-    incidence_angle_path: Path,
+    incidence_angle_path: Path | None,
+    los_enu_path: Path | None,
     interp_method: str,
 ) -> xr.DataArray:
     """Compute the day-1 LOS correction once (serial)."""
     dem = _open_2d(dem_path)
-    los_up = _read_los_up(incidence_angle_path)
+    los_up = _read_los_up(incidence_angle_path, los_enu_path)
 
     ds0 = xr.open_dataset(first_cropped, engine="h5netcdf")
     zenith_delay_2d = _height_to_dem_surface(ds0.total_delay, dem, method=interp_method)
@@ -113,7 +114,8 @@ def _create_reference_correction(
     ref_tropo_file: Path,
     ref_date_str: str,
     dem_path: Path,
-    incidence_angle_path: Path,
+    incidence_angle_path: Path | None,
+    los_enu_path: Path | None,
     interp_method: str,
     output_dir: Path,
 ) -> Path:
@@ -123,7 +125,7 @@ def _create_reference_correction(
     else:
         logger.info(f"Computing reference correction for {ref_date_str}")
         ref_corr = _compute_reference_correction(
-            ref_tropo_file, dem_path, incidence_angle_path, interp_method
+            ref_tropo_file, dem_path, incidence_angle_path, los_enu_path, interp_method
         )
         ref_corr.rio.to_raster(ref_corr_path, **GTIFF_KWARGS)
     return ref_corr_path
@@ -132,7 +134,8 @@ def _create_reference_correction(
 def _apply_one(
     cropped_file: Path,
     dem_path: Path,
-    incidence_angle_path: Path,
+    incidence_angle_path: Path | None,
+    los_enu_path: Path | None,
     interp_method: str,
     output_file: Path,
     ref_corr_path: Path | None,
@@ -147,7 +150,7 @@ def _apply_one(
             return (date_str, "skipped")
 
         dem = _open_2d(dem_path)
-        los_up = _read_los_up(incidence_angle_path)
+        los_up = _read_los_up(incidence_angle_path, los_enu_path)
 
         ds = xr.open_dataset(cropped_file, engine="h5netcdf")
         zenith_delay_2d = _height_to_dem_surface(
@@ -185,16 +188,49 @@ def _apply_one(
         return (date_str, "ok")
 
 
-def _read_los_up(incidence_angle_path: Path) -> xr.DataArray:
-    da = rxr.open_rasterio(incidence_angle_path).squeeze(drop=True)
-    # LOS 'up' component equals cos(incidence). Convert degrees -> radians, then cos.
-    return np.cos(np.radians(da))
+def _read_los_up(
+    incidence_angle_path: Path | None = None,
+    los_enu_path: Path | None = None,
+) -> xr.DataArray:
+    """Read LOS up component from either incidence angle or ENU raster.
+
+    Parameters
+    ----------
+    incidence_angle_path : Path, optional
+        Raster with incidence angle in degrees. los_up = cos(incidence).
+    los_enu_path : Path, optional
+        3-band raster with LOS (east, north, up) unit vector components.
+        Band 3 is the 'up' component directly.
+
+    Returns
+    -------
+    xr.DataArray
+        The LOS 'up' component as a 2D array.
+
+    """
+    if incidence_angle_path is not None and los_enu_path is not None:
+        msg = "Provide only one of incidence_angle_path or los_enu_path, not both"
+        raise ValueError(msg)
+    if incidence_angle_path is None and los_enu_path is None:
+        msg = "Must provide either incidence_angle_path or los_enu_path"
+        raise ValueError(msg)
+
+    if incidence_angle_path is not None:
+        da = rxr.open_rasterio(incidence_angle_path).squeeze(drop=True)
+        # los_up = cos(incidence_angle) after converting degrees -> radians
+        return np.cos(np.radians(da))
+    else:
+        # los_enu_path is a 3-band raster: (E, N, U)
+        da = rxr.open_rasterio(los_enu_path)
+        # Band 3 (index 2) is the 'up' component
+        return da.isel(band=2).squeeze(drop=True)
 
 
 def apply_tropo(
     cropped_tropo_list: list[Path],
     dem_path: Path,
-    incidence_angle_path: Path,
+    incidence_angle_path: Path | None = None,
+    los_enu_path: Path | None = None,
     output_dir: Path = Path("tropo_corrections"),
     interp_method: str = "linear",
     subtract_first_date: bool = True,
@@ -208,9 +244,12 @@ def apply_tropo(
         Paths to cropped TROPO NetCDFs from `tropo-crop`.
     dem_path : Path
         DEM GeoTIFF (UTM or WGS84).
-    incidence_angle_path : Path
+    incidence_angle_path : Path, optional
         Raster containing ellipsoidal incidence angle (in degrees) for each pixel
-        of `dem_path`.
+        of `dem_path`. Provide this OR `los_enu_path`, not both.
+    los_enu_path : Path, optional
+        3-band GeoTIFF with LOS (east, north, up) unit vector components.
+        Band 3 is the 'up' component. Provide this OR `incidence_angle_path`, not both.
     output_dir : Path
         Output directory for correction GeoTIFFs.
     interp_method : {"linear", "nearest", "slinear", "cubic", "quintic", "pchip"}
@@ -224,6 +263,13 @@ def apply_tropo(
     """
     if not cropped_tropo_list:
         msg = "No inputs provided."
+        raise ValueError(msg)
+    # Validate that exactly one LOS input is provided
+    if incidence_angle_path is None and los_enu_path is None:
+        msg = "Must provide either incidence_angle_path or los_enu_path"
+        raise ValueError(msg)
+    if incidence_angle_path is not None and los_enu_path is not None:
+        msg = "Provide only one of incidence_angle_path or los_enu_path, not both"
         raise ValueError(msg)
     methods = {"linear", "nearest", "slinear", "cubic", "quintic", "pchip"}
     if interp_method not in methods:
@@ -248,6 +294,7 @@ def apply_tropo(
             dates_sorted[0].strftime(fmt),
             dem_path,
             incidence_angle_path,
+            los_enu_path,
             interp_method,
             output_dir,
         )
@@ -272,6 +319,7 @@ def apply_tropo(
                 Path(cropped_file),
                 dem_path,
                 incidence_angle_path,
+                los_enu_path,
                 interp_method,
                 Path(out_file),
                 ref_corr_path,

@@ -73,6 +73,8 @@ disp = [
   "zarr>=3",
 ]
 tropo = ["opera-utils[disp]", "rioxarray", "scipy"]
+capella = ["capella-reader"]
+tropo-capella = ["opera-utils[tropo]", "capella-reader"]
 asf = ["asf_search"]
 all = ["opera-utils[tropo,asf,disp,geopandas]"]
 
