@@ -76,7 +76,14 @@ tropo = ["opera-utils[disp]", "rioxarray", "scipy"]
 capella = ["capella-reader"]
 tropo-capella = ["opera-utils[tropo]", "capella-reader"]
 asf = ["asf_search"]
-all = ["opera-utils[tropo,asf,disp,geopandas]"]
+# Work with NISAR GSLC data - downloads and subsetting
+nisar = [
+  "aiohttp",
+  "fsspec",
+  "s3fs",
+  "tqdm",
+]
+all = ["opera-utils[tropo,asf,disp,geopandas,nisar]"]
 
 test = [
   "asf_search",
