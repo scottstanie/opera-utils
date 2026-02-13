@@ -89,6 +89,26 @@ def _bracket(url_series: pd.Series, ts: pd.Timestamp) -> tuple[str, str]:
     return early_url, late_url
 
 
+_fs_cache: object | None = None
+
+
+def _get_earthaccess_fs():
+    """Get an authenticated fsspec HTTPS session via earthaccess.
+
+    Caches the session per-process so it survives across calls within the
+    same worker, but each spawned worker creates its own session.
+    """
+    global _fs_cache  # noqa: PLW0603
+    import earthaccess
+
+    if _fs_cache is not None:
+        return _fs_cache
+
+    earthaccess.login()
+    _fs_cache = earthaccess.get_fsspec_https_session()
+    return _fs_cache
+
+
 @lru_cache(maxsize=16)
 def _open_crop(
     url: str,
@@ -98,15 +118,19 @@ def _open_crop(
     use_netrc: bool = True,
 ) -> xr.Dataset:
     """Lazy-open a single L4 file and subset to bbox+height."""
-    if use_netrc:
-        # Netrc authentication for Earthdata
-        backend_kwargs = {
-            "storage_options": {"client_kwargs": {"trust_env": True}}  # Use .netrc
-        }
-    else:
-        backend_kwargs = {}
-
-    ds = xr.open_dataset(url, engine="h5netcdf", backend_kwargs=backend_kwargs)
+    try:
+        fs = _get_earthaccess_fs()
+        f = fs.open(url)
+        ds = xr.open_dataset(f, engine="h5netcdf")
+    except Exception:
+        logger.warning("earthaccess session failed, falling back to netrc auth")
+        if use_netrc:
+            backend_kwargs: dict = {
+                "storage_options": {"client_kwargs": {"trust_env": True}}
+            }
+        else:
+            backend_kwargs = {}
+        ds = xr.open_dataset(url, engine="h5netcdf", backend_kwargs=backend_kwargs)
 
     lat_max, lat_min = lat_bounds  # note south-to-north ordering in slice
     lon_min, lon_max = lon_bounds

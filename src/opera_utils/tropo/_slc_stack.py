@@ -110,7 +110,7 @@ def extract_stack_info_capella(
         datetimes.append(dt)
 
         # bounds is (min_lon, min_lat, max_lon, max_lat) = (west, south, east, north)
-        w, s, e, n = slc.bounds
+        w, s, e, n = slc.bounds  # noqa[misc]
         west_vals.append(w)
         south_vals.append(s)
         east_vals.append(e)
