@@ -22,7 +22,7 @@ def create_tropo_corrections_for_stack(
     dem_path: Path,
     los_path: Path,
     output_dir: Path = Path("tropo_corrections"),
-    sensor: Literal["capella"] = "capella",
+    sensor: str = "capella",
     los_type: Literal["incidence_angle", "enu"] = "incidence_angle",
     margin_deg: float = 0.3,
     height_max: float = 10000.0,

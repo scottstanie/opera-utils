@@ -185,9 +185,12 @@ def _get_tropo_url(umm_data: dict, protocol: UrlType = UrlType.HTTPS) -> str:
     for url_info in umm_data.get("RelatedUrls", []):
         url = url_info.get("URL", "")
         url_type = url_info.get("Type", "")
-        if url_type.startswith("GET DATA") and url.endswith(".nc"):
-            if url.startswith(str(protocol)):
-                return url
+        if (
+            url_type.startswith("GET DATA")
+            and url.endswith(".nc")
+            and url.startswith(str(protocol))
+        ):
+            return url
 
     # Fallback: find any .nc URL
     for url_info in umm_data.get("RelatedUrls", []):
