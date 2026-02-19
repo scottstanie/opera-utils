@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 from datetime import timedelta
 from pathlib import Path
-from typing import Literal
 
 from opera_utils.tropo._apply import apply_tropo
 from opera_utils.tropo._crop import crop_tropo
@@ -20,10 +19,10 @@ logger = logging.getLogger("opera_utils")
 def create_tropo_corrections_for_stack(
     slc_files: list[Path],
     dem_path: Path,
-    los_path: Path,
     output_dir: Path = Path("tropo_corrections"),
     sensor: str = "capella",
-    los_type: Literal["incidence_angle", "enu"] = "incidence_angle",
+    incidence_angle: Path | float | None = None,
+    los_enu_path: Path | None = None,
     margin_deg: float = 0.3,
     height_max: float = 10000.0,
     subtract_first_date: bool = True,
@@ -45,20 +44,19 @@ def create_tropo_corrections_for_stack(
         List of SLC file paths.
     dem_path : Path
         DEM GeoTIFF (UTM or WGS84).
-    los_path : Path
-        LOS geometry raster. Either incidence angle or ENU components
-        depending on `los_type`.
     output_dir : Path
         Output directory for correction GeoTIFFs.
         Default is "tropo_corrections".
     sensor : str
-        Sensor type. Currently only "capella" is supported.
-        Default is "capella".
-    los_type : {"incidence_angle", "enu"}
-        Type of LOS geometry raster:
-        - "incidence_angle": Single-band raster with incidence angle in degrees.
-        - "enu": 3-band raster with LOS (east, north, up) unit vector components.
-        Default is "incidence_angle".
+        Sensor name (case-insensitive).  Must have been registered via
+        `register_sensor`.  Default is ``"capella"``.
+    incidence_angle : Path | float, optional
+        Incidence angle input: either a georeferenced raster (Path) with
+        incidence angle in degrees, or a scalar float (degrees) applied
+        uniformly.  Provide this OR `los_enu_path`, not both.
+    los_enu_path : Path, optional
+        3-band GeoTIFF with LOS (east, north, up) unit vector components.
+        Provide this OR `incidence_angle`, not both.
     margin_deg : float
         Additional margin in degrees around AOI bounds.
         Default is 0.3 degrees.
@@ -137,13 +135,10 @@ def create_tropo_corrections_for_stack(
     assert len(cropped_files) > 0, "No cropped TROPO files found after cropping"
 
     logger.info("Applying tropospheric corrections...")
-    incidence_angle_path = los_path if los_type == "incidence_angle" else None
-    los_enu_path = los_path if los_type == "enu" else None
-
     apply_tropo(
         cropped_tropo_list=cropped_files,
         dem_path=dem_path,
-        incidence_angle_path=incidence_angle_path,
+        incidence_angle=incidence_angle,
         los_enu_path=los_enu_path,
         output_dir=output_dir,
         subtract_first_date=subtract_first_date,

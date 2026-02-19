@@ -20,6 +20,7 @@ from ._helpers import (
     _create_total_delay,
     _interp_in_time,
     _open_crop,
+    init_fs,
 )
 
 logger = logging.getLogger(__name__)
@@ -178,7 +179,7 @@ def crop_tropo(
     status_counts: dict[str, int] = {"ok": 0, "skipped": 0, "missing": 0, "error": 0}
 
     if num_workers > 1:
-        with ProcessPoolExecutor(max_workers=num_workers) as ex:
+        with ProcessPoolExecutor(max_workers=num_workers, initializer=init_fs) as ex:
             for dt in datetimes:
                 futures.append(
                     ex.submit(
@@ -207,6 +208,7 @@ def crop_tropo(
                     status_counts[status] = status_counts.get(status, 0) + 1
 
     else:
+        init_fs()
         for dt in datetimes:
             _process_one_datetime(
                 dt,
