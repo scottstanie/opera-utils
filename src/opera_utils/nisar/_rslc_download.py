@@ -1,25 +1,31 @@
-"""Download and subset NISAR GSLC products."""
+"""Download and subset NISAR RSLC products."""
 
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 
 import h5py
+import numpy as np
 from shapely import from_wkt
 from tqdm.auto import tqdm
 from tqdm.contrib.concurrent import process_map
 
-from opera_utils.nisar._product import NISAR_GSLC_GRIDS, NISAR_POLARIZATIONS
-
-from ._product import GslcProduct, UrlType
+from ._product import (
+    NISAR_POLARIZATIONS,
+    NISAR_RSLC_GEOLOCATION,
+    NISAR_RSLC_SWATHS,
+    RslcProduct,
+    UrlType,
+)
 from ._remote import open_h5
 from ._search import search
 
 logger = logging.getLogger("opera_utils")
 
-__all__ = ["process_file", "run_download"]
+__all__ = ["process_file", "run_rslc_download"]
 
 
 def process_file(
@@ -30,12 +36,12 @@ def process_file(
     frequency: str = "A",
     polarizations: list[str] | None = None,
 ) -> Path:
-    """Download and subset a single NISAR GSLC product.
+    """Download and subset a single NISAR RSLC product.
 
     Parameters
     ----------
     url : str
-        URL of the GSLC product to download.
+        URL of the RSLC product to download.
     rows : slice | None
         Rows of the product to subset.
     cols : slice | None
@@ -61,19 +67,19 @@ def process_file(
         return outpath
 
     if Path(url).exists():
-        # For local files, directly extract subset
-        _extract_subset(
-            url,
-            outpath=outpath,
-            rows=rows,
-            cols=cols,
-            frequency=frequency,
-            polarizations=polarizations,
-        )
+        with h5py.File(url, "r") as src:
+            _extract_rslc_subset_from_h5(
+                src,
+                outpath=outpath,
+                rows=rows,
+                cols=cols,
+                frequency=frequency,
+                polarizations=polarizations,
+                source_name=str(url),
+            )
     else:
-        # For remote urls (S3 or HTTPS), use open_h5 with cloud-optimized settings
         with open_h5(url) as src:
-            _extract_subset_from_h5(
+            _extract_rslc_subset_from_h5(
                 src,
                 outpath=outpath,
                 rows=rows,
@@ -86,42 +92,7 @@ def process_file(
     return outpath
 
 
-def _extract_subset(
-    input_obj: Path | str,
-    outpath: Path | str,
-    rows: slice | None,
-    cols: slice | None,
-    frequency: str = "A",
-    polarizations: list[str] | None = None,
-    chunks: tuple[int, int] = (256, 256),
-) -> None:
-    """Extract a spatial subset from a local GSLC HDF5 file.
-
-    Parameters
-    ----------
-    input_obj : Path | str
-        Input HDF5 file path.
-    outpath : Path | str
-        Output HDF5 file path.
-    rows : slice | None
-        Row slice for subsetting. None means all rows.
-    cols : slice | None
-        Column slice for subsetting. None means all cols.
-    frequency : str
-        Frequency band to extract ("A" or "B"). Default is "A".
-    polarizations : list[str] | None
-        List of polarizations to extract. None means all available.
-    chunks : tuple[int, int]
-        Chunk size for output datasets.
-
-    """
-    with h5py.File(input_obj, "r") as src:
-        _extract_subset_from_h5(
-            src, outpath, rows, cols, frequency, polarizations, chunks, str(input_obj)
-        )
-
-
-def _extract_subset_from_h5(
+def _extract_rslc_subset_from_h5(
     src: h5py.File,
     outpath: Path | str,
     rows: slice | None,
@@ -131,7 +102,7 @@ def _extract_subset_from_h5(
     chunks: tuple[int, int] = (256, 256),
     source_name: str = "remote",
 ) -> None:
-    """Extract a spatial subset from an open HDF5 file handle.
+    """Extract a spatial subset from an open RSLC HDF5 file handle.
 
     Parameters
     ----------
@@ -156,80 +127,85 @@ def _extract_subset_from_h5(
     row_slice = rows if rows is not None else slice(None)
     col_slice = cols if cols is not None else slice(None)
 
+    freq_path = f"{NISAR_RSLC_SWATHS}/frequency{frequency}"
+    assert freq_path in src, f"Frequency {frequency} not found in {source_name}"
+
+    available_pols = [name for name in src[freq_path] if name in NISAR_POLARIZATIONS]
+
+    if polarizations is None:
+        pols_to_extract = available_pols
+    else:
+        pols_to_extract = [p for p in polarizations if p in available_pols]
+        missing = set(polarizations) - set(available_pols)
+        if missing:
+            logger.warning(f"Polarizations not found: {missing}")
+
+    assert pols_to_extract, f"No polarizations to extract from {source_name}"
+
     with h5py.File(outpath, "w") as dst:
-        # Note: We skip copying identification/metadata groups for remote files
-        # because h5py's copy() doesn't work well with fsspec byte-range access.
-        # The essential georeferencing info is in the frequency group.
-
-        # Get available polarizations for the frequency
-        freq_path = f"{NISAR_GSLC_GRIDS}/frequency{frequency}"
-        if freq_path not in src:
-            msg = f"Frequency {frequency} not found in {source_name}"
-            raise ValueError(msg)
-
-        available_pols = [
-            name for name in src[freq_path] if name in NISAR_POLARIZATIONS
-        ]
-
-        if polarizations is None:
-            pols_to_extract = available_pols
-        else:
-            pols_to_extract = [p for p in polarizations if p in available_pols]
-            missing = set(polarizations) - set(available_pols)
-            if missing:
-                logger.warning(f"Polarizations not found: {missing}")
-
-        if not pols_to_extract:
-            msg = f"No polarizations to extract from {source_name}"
-            raise ValueError(msg)
-
-        # Create the grids structure
-        dst.create_group(NISAR_GSLC_GRIDS)
+        # Create the swaths structure
+        dst.create_group(NISAR_RSLC_SWATHS)
         dst_freq_group = dst.create_group(freq_path)
 
-        # Copy coordinate datasets if present (x, y coordinates)
-        for coord_name in [
-            "xCoordinates",
-            "yCoordinates",
-            "xCoordinateSpacing",
-            "yCoordinateSpacing",
-        ]:
-            if coord_name in src[freq_path]:
-                coord_data = src[freq_path][coord_name]
-                if coord_name in ["xCoordinates", "yCoordinates"]:
-                    # These need to be subsetted
-                    if coord_name == "xCoordinates":
-                        subset_data = coord_data[col_slice]
-                    else:
-                        subset_data = coord_data[row_slice]
-                    dst_freq_group.create_dataset(coord_name, data=subset_data)
-                else:
-                    # Scalar values, just copy
-                    dst_freq_group.create_dataset(coord_name, data=coord_data[()])
+        # Copy shared zeroDopplerTime (subsetted by rows)
+        zdt_path = f"{NISAR_RSLC_SWATHS}/zeroDopplerTime"
+        dst.create_dataset(zdt_path, data=src[zdt_path][row_slice])
 
-        # Copy projection info if present
-        for proj_name in ["projection", "epsg"]:
-            if proj_name in src[freq_path]:
-                proj_data = src[freq_path][proj_name]
-                if isinstance(proj_data, h5py.Dataset):
-                    dst_freq_group.create_dataset(proj_name, data=proj_data[()])
+        # Copy zeroDopplerTimeSpacing (scalar)
+        zdt_spacing_path = f"{NISAR_RSLC_SWATHS}/zeroDopplerTimeSpacing"
+        if zdt_spacing_path in src:
+            dst.create_dataset(zdt_spacing_path, data=src[zdt_spacing_path][()])
+
+        # Copy per-frequency slantRange (subsetted by cols)
+        sr_path = f"{freq_path}/slantRange"
+        dst_freq_group.create_dataset("slantRange", data=src[sr_path][col_slice])
+
+        # Copy per-frequency scalar metadata
+        for scalar_name in [
+            "slantRangeSpacing",
+            "acquiredCenterFrequency",
+            "acquiredRangeBandwidth",
+            "processedCenterFrequency",
+            "processedRangeBandwidth",
+            "processedAzimuthBandwidth",
+            "nominalAcquisitionPRF",
+            "numberOfSubSwaths",
+            "sceneCenterAlongTrackSpacing",
+            "sceneCenterGroundRangeSpacing",
+        ]:
+            scalar_path = f"{freq_path}/{scalar_name}"
+            if scalar_path in src:
+                dst_freq_group.create_dataset(scalar_name, data=src[scalar_path][()])
+
+        # Copy listOfPolarizations
+        lop_path = f"{freq_path}/listOfPolarizations"
+        if lop_path in src:
+            dst_freq_group.create_dataset("listOfPolarizations", data=src[lop_path][:])
+
+        # Subset validSamplesSubSwath datasets
+        col_start = col_slice.start or 0
+        for key in src[freq_path]:
+            if re.match(r"validSamplesSubSwath\d+", key):
+                valid_data = src[f"{freq_path}/{key}"][row_slice, :]
+                # Adjust column indices by subtracting col_start
+                adjusted = valid_data.copy()
+                adjusted = np.clip(
+                    adjusted.astype(np.int64) - col_start, 0, None
+                ).astype(valid_data.dtype)
+                dst_freq_group.create_dataset(key, data=adjusted)
 
         # Extract each polarization
         for pol in pols_to_extract:
             pol_path = f"{freq_path}/{pol}"
             src_dset = src[pol_path]
 
-            # Get the subset
             subset_data = src_dset[row_slice, col_slice]
-
-            # Determine chunk size (don't exceed data dimensions)
             out_shape = subset_data.shape
             actual_chunks = (
                 min(chunks[0], out_shape[0]),
                 min(chunks[1], out_shape[1]),
             )
 
-            # Create output dataset with compression
             dst.create_dataset(
                 pol_path,
                 data=subset_data,
@@ -244,23 +220,103 @@ def _extract_subset_from_h5(
 
             logger.debug(f"Extracted {pol}: {src_dset.shape} -> {out_shape}")
 
+        # Subset the geolocation grid to match the time/range extent
+        _subset_geolocation_grid(src, dst, row_slice, col_slice, frequency)
+
         # Store subset metadata
         dst.attrs["subset_rows"] = str(row_slice)
         dst.attrs["subset_cols"] = str(col_slice)
         dst.attrs["source_file"] = source_name
 
 
-def _get_rowcol_slice(
-    product: GslcProduct,
-    bbox: tuple[float, float, float, float] | None,
-    frequency: str = "A",
-) -> tuple[slice | None, slice | None]:
-    """Convert a bounding box to row/col slices.
+def _subset_geolocation_grid(
+    src: h5py.File,
+    dst: h5py.File,
+    row_slice: slice,
+    col_slice: slice,
+    frequency: str,
+) -> None:
+    """Subset the geolocation grid to match the subsetted swath extent.
 
     Parameters
     ----------
-    product : GslcProduct
-        A GSLC product to use for coordinate conversion.
+    src : h5py.File
+        Source HDF5 file.
+    dst : h5py.File
+        Destination HDF5 file.
+    row_slice : slice
+        Row slice applied to the swath data.
+    col_slice : slice
+        Column slice applied to the swath data.
+    frequency : str
+        Frequency band used for slantRange.
+
+    """
+    if NISAR_RSLC_GEOLOCATION not in src:
+        return
+
+    geoloc_src = src[NISAR_RSLC_GEOLOCATION]
+    dst.create_group(NISAR_RSLC_GEOLOCATION)
+
+    # Get the subsetted swath time and range extents
+    swath_zdt = src[f"{NISAR_RSLC_SWATHS}/zeroDopplerTime"][row_slice]
+    swath_sr = src[f"{NISAR_RSLC_SWATHS}/frequency{frequency}/slantRange"][col_slice]
+
+    geoloc_zdt = geoloc_src["zeroDopplerTime"][:]
+    geoloc_sr = geoloc_src["slantRange"][:]
+
+    # Find geolocation grid indices that cover the subsetted swath extent
+    az_start = max(0, int(np.searchsorted(geoloc_zdt, swath_zdt[0])) - 1)
+    az_stop = min(len(geoloc_zdt), int(np.searchsorted(geoloc_zdt, swath_zdt[-1])) + 2)
+    rg_start = max(0, int(np.searchsorted(geoloc_sr, swath_sr[0])) - 1)
+    rg_stop = min(len(geoloc_sr), int(np.searchsorted(geoloc_sr, swath_sr[-1])) + 2)
+
+    az_slice = slice(az_start, az_stop)
+    rg_slice = slice(rg_start, rg_stop)
+
+    # Copy 1D axes (subsetted)
+    dst.create_dataset(
+        f"{NISAR_RSLC_GEOLOCATION}/zeroDopplerTime",
+        data=geoloc_zdt[az_slice],
+    )
+    dst.create_dataset(
+        f"{NISAR_RSLC_GEOLOCATION}/slantRange",
+        data=geoloc_sr[rg_slice],
+    )
+
+    # Copy heightAboveEllipsoid (not subsetted)
+    dst.create_dataset(
+        f"{NISAR_RSLC_GEOLOCATION}/heightAboveEllipsoid",
+        data=geoloc_src["heightAboveEllipsoid"][:],
+    )
+
+    # Copy 3D datasets (subsetted in az and rg dimensions)
+    for name in ["coordinateX", "coordinateY"]:
+        if name in geoloc_src:
+            dst.create_dataset(
+                f"{NISAR_RSLC_GEOLOCATION}/{name}",
+                data=geoloc_src[name][:, az_slice, rg_slice],
+            )
+
+    # Copy scalar datasets
+    if "epsg" in geoloc_src:
+        dst.create_dataset(
+            f"{NISAR_RSLC_GEOLOCATION}/epsg",
+            data=geoloc_src["epsg"][()],
+        )
+
+
+def _get_rslc_rowcol_slice(
+    product: RslcProduct,
+    bbox: tuple[float, float, float, float] | None,
+    frequency: str = "A",
+) -> tuple[slice | None, slice | None]:
+    """Convert a bounding box to row/col slices for RSLC products.
+
+    Parameters
+    ----------
+    product : RslcProduct
+        An RSLC product to use for coordinate conversion.
     bbox : tuple[float, float, float, float] | None
         Bounding box as (west, south, east, north) in degrees lon/lat.
     frequency : str
@@ -277,7 +333,6 @@ def _get_rowcol_slice(
 
     lon_left, lat_bottom, lon_right, lat_top = bbox
 
-    # Need to open the file to get coordinate info
     with open_h5(str(product.filename)) as h5f:
         row_start, col_start = product.lonlat_to_rowcol(
             h5f, lon_left, lat_top, frequency
@@ -310,7 +365,7 @@ def _run_file(
     return process_file(url, rows, cols, output_dir, frequency, polarizations)
 
 
-def run_download(
+def run_rslc_download(
     bbox: tuple[float, float, float, float] | None = None,
     wkt: str | None = None,
     track_frame: str | None = None,
@@ -325,13 +380,13 @@ def run_download(
     frequency: str = "A",
     polarizations: list[str] | None = None,
     url_type: UrlType = UrlType.HTTPS,
-    short_name: str = "NISAR_L2_GSLC_BETA_V1",
+    short_name: str = "NISAR_L1_RSLC_BETA_V1",
     num_workers: int = 4,
-    output_dir: Path = Path("./gslc_subsets"),
+    output_dir: Path = Path("./rslc_subsets"),
 ) -> list[Path]:
-    """Download and subset NISAR GSLC products.
+    """Download and subset NISAR RSLC products.
 
-    This function downloads and subsets NISAR GSLC HDF5 products from
+    This function downloads and subsets NISAR RSLC HDF5 products from
     Earthdata and saves them to the local file system.
 
     The `bbox` parameter serves dual purposes: it filters the CMR search to find
@@ -379,13 +434,13 @@ def run_download(
         Default is HTTPS.
     short_name : str
         CMR collection short name.
-        Default is "NISAR_L2_GSLC_BETA_V1" (beta products).
+        Default is "NISAR_L1_RSLC_BETA_V1" (beta products).
     num_workers : int
         Number of workers to use for downloading and subsetting.
         Default is 4.
     output_dir : Path
         Directory to save the downloaded and subsetted products to.
-        Default is "./gslc_subsets".
+        Default is "./rslc_subsets".
 
     Returns
     -------
@@ -396,7 +451,7 @@ def run_download(
     --------
     Download by bounding box (searches CMR and subsets to that region):
 
-    >>> run_download(  # doctest: +SKIP
+    >>> run_rslc_download(  # doctest: +SKIP
     ...     bbox=(40.62, 13.56, 40.72, 13.64), polarizations=["HH"]
     ... )
 
@@ -428,7 +483,7 @@ def run_download(
         short_name=short_name,
     )
     n_urls = len(results)
-    logger.info(f"Found {n_urls} GSLC products")
+    logger.info(f"Found {n_urls} RSLC products")
 
     if n_urls == 0:
         logger.warning("No products found matching search criteria")
@@ -436,10 +491,10 @@ def run_download(
 
     # Convert bbox or row/col tuples to slices
     if bbox is not None:
-        # Use first product to convert bbox to row/col (all products share same grid)
-        first_gslc = results[0]
-        assert isinstance(first_gslc, GslcProduct)
-        row_slice, col_slice = _get_rowcol_slice(first_gslc, bbox, frequency)
+        # Use first product to convert bbox to row/col
+        first_rslc = results[0]
+        assert isinstance(first_rslc, RslcProduct)
+        row_slice, col_slice = _get_rslc_rowcol_slice(first_rslc, bbox, frequency)
         logger.info(f"Converted bbox {bbox} to rows: {row_slice}, cols: {col_slice}")
     else:
         row_slice = slice(*rows) if rows is not None else None

@@ -1,4 +1,4 @@
-"""NISAR GSLC utilities for reading and analyzing geocoded SLC data."""
+"""NISAR utilities for reading and analyzing GSLC and RSLC data."""
 
 from __future__ import annotations
 
@@ -11,14 +11,24 @@ from ._info import (
     nisar_frame_info,
     plot_frames,
 )
-from ._product import GslcProduct, OrbitDirection, OutOfBoundsError, UrlType
+from ._product import (
+    GslcProduct,
+    NisarProduct,
+    OrbitDirection,
+    OutOfBoundsError,
+    RslcProduct,
+    UrlType,
+)
 from ._remote import open_file, open_h5
+from ._rslc_download import run_rslc_download
 from ._search import search
 
 __all__ = [
     "GslcProduct",
+    "NisarProduct",
     "OrbitDirection",
     "OutOfBoundsError",
+    "RslcProduct",
     "UrlType",
     "find_intersecting_frames",
     "get_frame_latlon_bounds",
@@ -29,5 +39,6 @@ __all__ = [
     "open_h5",
     "plot_frames",
     "run_download",
+    "run_rslc_download",
     "search",
 ]

@@ -1,4 +1,4 @@
-"""Search for NISAR GSLC products from CMR.
+"""Search for NISAR products from CMR.
 
 Examples
 --------
@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 
 from opera_utils._cmr import fetch_cmr_pages
 
-from ._product import GslcProduct, UrlType
+from ._product import NisarProduct, UrlType
 
 __all__ = ["search"]
 
@@ -38,8 +38,8 @@ def search(
     short_name: str = NISAR_GSLC_SHORT_NAME,
     provider: str = "ASF",
     print_urls: bool = False,
-) -> list[GslcProduct]:
-    """Query CMR for NISAR GSLC granules matching the given criteria.
+) -> list[NisarProduct]:
+    """Query CMR for NISAR granules matching the given criteria.
 
     Parameters
     ----------
@@ -72,12 +72,12 @@ def search(
         The CMR data provider. Default is "ASF".
     print_urls : bool
         If True, prints out the result urls to stdout in addition to returning
-        the `GslcProduct` objects.
+        the `NisarProduct` objects.
         Default is False.
 
     Returns
     -------
-    list[GslcProduct]
+    list[NisarProduct]
         List of products matching the search criteria.
 
     Examples
@@ -154,10 +154,10 @@ def search(
 
     items = fetch_cmr_pages(search_url, params)
 
-    products: list[GslcProduct] = []
+    products: list[NisarProduct] = []
     for item in items:
         try:
-            product = GslcProduct.from_umm(item["umm"], url_type=url_type)
+            product = NisarProduct.from_umm(item["umm"], url_type=url_type)
             # Filter by track_frame if specified (exact match including cycle)
             if track_frame is not None and product.track_frame_id != track_frame:
                 continue
