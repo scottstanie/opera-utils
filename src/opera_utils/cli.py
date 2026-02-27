@@ -173,10 +173,17 @@ def cli_app() -> None:
     try:
         from opera_utils.nisar._download import run_download as nisar_download
         from opera_utils.nisar._info import nisar_frame_info
+        from opera_utils.nisar._rslc_download import (
+            run_rslc_download as nisar_rslc_download,
+        )
         from opera_utils.nisar._search import search as nisar_search
 
         cli_dict["nisar-gslc-download"] = nisar_download
         cli_dict["nisar-gslc-search"] = partial(nisar_search, print_urls=True)
+        cli_dict["nisar-rslc-download"] = nisar_rslc_download
+        cli_dict["nisar-rslc-search"] = partial(
+            nisar_search, short_name="NISAR_L1_RSLC_BETA_V1", print_urls=True
+        )
         cli_dict["nisar-frame-info"] = nisar_frame_info
 
     except ImportError:
