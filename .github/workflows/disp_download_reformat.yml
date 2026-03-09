@@ -36,6 +36,13 @@ on:
         description: End date (YYYY-MM-DD)
         required: true
         default: '2024-01-01'
+      quality_datasets:
+        type: string
+        description: >-
+          Quality dataset(s) to mask pixels before re-referencing.
+          Use "RECOMMENDED_MASK" (default), or "None" to skip masking.
+        required: false
+        default: 'RECOMMENDED_MASK'
       num_workers:
         type: number
         description: Parallel download workers
@@ -99,6 +106,7 @@ jobs:
           echo "Reformatting to ${{ inputs.output_name }}"
           opera-utils disp-s1-reformat \
             --reference-method ${{ inputs.reference_method }} \
+            --quality-datasets ${{ inputs.quality_datasets }} \
             --output-name ${{ inputs.output_name }} \
             --input-files subset-ncs/OPERA_L3_DISP-S1*.nc
 
