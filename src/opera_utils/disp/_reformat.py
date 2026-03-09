@@ -57,7 +57,7 @@ def reformat_stack(
     reference_lat: float | None = None,
     reference_border_pixels: int = 3,
     reference_coherence_threshold: float = 0.7,
-    process_chunk_size: tuple[int, int] = (2048, 2048),
+    process_chunk_size: tuple[int, int] = (512, 512),
     do_round: bool = True,
 ) -> None:
     """Reformat NetCDF DISP-S1 files into one NetCDF/Zarr stack.
@@ -125,8 +125,9 @@ def reformat_stack(
         For ReferenceMethod.HIGH_COHERENCE, threshold for coherence to use as a mask.
         Defaults to 0.7.
     process_chunk_size : tuple[int, int]
-        Chunking configuration for processing DataArray.
-        Defaults to (2048, 2048).
+        Spatial chunking for processing. Controls peak memory during rebasing,
+        where all time steps are loaded per spatial block.
+        Defaults to (512, 512).
     do_round : bool
         If True, rounds mantissa bits of floating point rasters to compress the data.
 
@@ -360,14 +361,14 @@ def _write_rebased_stack(
     quality_datasets: Sequence[QualityDataset] | None = None,
     quality_thresholds: Sequence[float] | None = None,
     do_round: bool = True,
-    process_chunk_size: tuple[int, int] = (2048, 2048),
+    process_chunk_size: tuple[int, int] = (512, 512),
     shard_factors: tuple[int, int, int] = (1, 4, 4),
     nan_policy: str | NaNPolicy = NaNPolicy.propagate,
 ) -> None:
     da_displacement = ds[str(data_var)]
 
-    # For this, we want to work on the entire time stack at once
-    # Otherwise the summation in `create_rebased_displacement` won't work
+    # Load the entire time stack per spatial block for cumulative rebasing.
+    # Spatial chunk size controls peak memory: ~2 * n_time * cy * cx * 4 bytes.
     process_chunks = {
         "time": -1,
         "y": process_chunk_size[0],
