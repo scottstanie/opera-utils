@@ -214,13 +214,7 @@ def reformat_stack(
         for ds in QUALITY_DATASETS
         if ds != "water_mask" and str(ds) not in drop_vars
     ]
-    ds_remaining = ds[remaining_dsets].chunk(
-        {
-            "time": out_shard_dict["time"],
-            "y": process_chunk_dict["y"],
-            "x": process_chunk_dict["x"],
-        }
-    )
+    ds_remaining = ds[remaining_dsets].chunk(out_shard_dict)
     # TODO: make this configurable: currently we take every 15th coherence since, during
     # historical processing, the coherences are the same per ministack
     da_temp_coh = ds.temporal_coherence[::15]
