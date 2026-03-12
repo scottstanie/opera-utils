@@ -222,10 +222,14 @@ def reformat_stack(
     avg_coherence = da_temp_coh.shape[0] / (1.0 / da_temp_coh).sum(
         dim="time", skipna=False, min_count=1
     )
-    # Save the coherence to the output
+    # Save the coherence to the output, aligning chunks to the shard grid
+    spatial_shard = {
+        "y": out_shard_dict["y"],
+        "x": out_shard_dict["x"],
+    }
     ds_remaining["average_temporal_coherence"] = xr.DataArray(
         avg_coherence, dims=("y", "x"), coords={"y": ds.y, "x": ds.x}
-    )
+    ).chunk(spatial_shard)
     for var in ds_remaining.data_vars:
         # Round, if it's a float32
         d = ds_remaining[var]
