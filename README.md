@@ -55,6 +55,24 @@ We have set up Github Actions so that users can download and format subsets of D
 1. Select the Run workflow dropdown and supply the required information, then click the green Run workflow button
 1. The resulting reformatted Zarr will be preserved as Github Artifacts, which can be downloaded.
 
+#### Triggering workflows from the CLI
+
+With the [GitHub CLI](https://cli.github.com/) (`gh`), you can trigger workflows directly:
+
+```bash
+gh workflow run disp_download_reformat.yml -R <your-username>/opera-utils \
+  -f frame_id=20697 \
+  -f "bbox=-102.71 31.35 -102.6 31.45" \
+  -f reference_method=BORDER \
+  -f start_datetime=2016-01-01 \
+  -f end_datetime=2026-01-01 \
+  -f quality_datasets=None \
+  -f output_name=my-output.zarr \
+  -f workflow_name=my-run-name
+```
+
+Use `--ref <branch>` to run from a specific branch. Monitor runs with `gh run list -R <your-username>/opera-utils` and download artifacts with `gh run download <run-id> -R <your-username>/opera-utils`.
+
 You can also run the notebooks in the `docs/notebooks` directory:
 
 - [Jupyter Notebook](https://github.com/scottstanie/opera-utils/blob/add-tutorial-notebook/docs/notebooks/tutorial-disp-s1-stack.ipynb)
