@@ -62,7 +62,7 @@ jobs:
 
       # Earthdata credentials (if your commands hit NASA HTTPS)
       - name: Configure ~/.netrc for Earthdata
-        uses: extractions/netrc@v2
+        uses: extractions/netrc@v3
         with:
           machine: urs.earthdata.nasa.gov
           username: ${{ secrets.EARTHDATA_USERNAME }}
@@ -115,7 +115,7 @@ jobs:
 
       # Upload the final artefact (path determined by previous step)
       - name: Upload Result
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ inputs.output_name }}
           path: ${{ env.ARTIFACT_PATH }}
