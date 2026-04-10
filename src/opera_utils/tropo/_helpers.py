@@ -5,6 +5,7 @@ from datetime import timedelta
 from functools import lru_cache
 from pathlib import Path
 
+import fsspec
 import numpy as np
 import pandas as pd
 import rioxarray as rxr
@@ -13,9 +14,24 @@ from rasterio.enums import Resampling
 from scipy.interpolate import RegularGridInterpolator
 
 from opera_utils import get_dates
+from opera_utils._remote import get_https_fs
 
 logger = logging.getLogger(__name__)
 TROPO_INTERVAL = timedelta(hours=6)
+
+# Authenticated filesystem for the current process, set once by `init_fs()`.
+_fs: fsspec.AbstractFileSystem | None = None
+
+
+def init_fs() -> None:
+    """Create and store an authenticated HTTPS fsspec filesystem.
+
+    Call this once per process (e.g. as a `ProcessPoolExecutor` initializer)
+    so every subsequent `_open_crop` reuses the same session instead of
+    hitting the Earthdata auth endpoint repeatedly.
+    """
+    global _fs  # noqa: PLW0603
+    _fs = get_https_fs()
 
 
 class MissingTropoError(ValueError):
@@ -95,18 +111,24 @@ def _open_crop(
     lat_bounds: tuple[float, float],
     lon_bounds: tuple[float, float],
     h_max: float,
-    use_netrc: bool = True,
 ) -> xr.Dataset:
-    """Lazy-open a single L4 file and subset to bbox+height."""
-    if use_netrc:
-        # Netrc authentication for Earthdata
-        backend_kwargs = {
-            "storage_options": {"client_kwargs": {"trust_env": True}}  # Use .netrc
-        }
-    else:
-        backend_kwargs = {}
+    """Lazy-open a single L4 file and subset to bbox+height.
 
-    ds = xr.open_dataset(url, engine="h5netcdf", backend_kwargs=backend_kwargs)
+    Requires `init_fs` to have been called first (either directly or via
+    the pool initializer).  Exceptions from aiohttp/fsspec are re-raised
+    as `OSError` so they remain picklable across process boundaries.
+    """
+    assert _fs is not None, "init_fs() must be called before _open_crop()"
+    try:
+        f = _fs.open(url)
+        ds = xr.open_dataset(f, engine="h5netcdf")
+    except OSError:
+        raise
+    except Exception as exc:
+        # aiohttp exceptions carry unpicklable CIMultiDictProxy headers;
+        # convert to a plain OSError so ProcessPoolExecutor can serialize it.
+        msg = f"Failed to open {url}: {exc}"
+        raise OSError(msg) from None
 
     lat_max, lat_min = lat_bounds  # note south-to-north ordering in slice
     lon_min, lon_max = lon_bounds
