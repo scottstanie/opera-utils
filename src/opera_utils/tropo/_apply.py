@@ -24,7 +24,11 @@ GTIFF_KWARGS = {
     "tiled": True,
     "predictor": 2,
     "dtype": "float32",
-    "nbits": 16,
+    # NB: NBITS=16 with dtype=float32 used to be set here as a "Float16"
+    # encoding hack, but GDAL warns ("NBITS is not supported for data type
+    # Float16") and rasterio's dtype map has no entry for GDT_Float16, so
+    # any reader that opens the result via rasterio crashes with
+    # `KeyError: 15`. Drop NBITS and just write full float32.
 }
 
 
