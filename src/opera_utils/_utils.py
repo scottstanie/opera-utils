@@ -35,6 +35,16 @@ def format_nc_filename(filename: PathOrStr, ds_name: str | None = None) -> str:
     If `filename` is already formatted, or if `filename` is not an HDF5/NetCDF
     file (based on the file extension), it is returned unchanged.
 
+    The driver prefix is chosen by file extension:
+
+    - ``.nc``  → ``NETCDF:"file":"//ds"`` (CF-compliant netCDF)
+    - ``.h5``  → ``HDF5:"file":"//ds"`` (raw HDF5)
+
+    For files with no CF metadata (e.g. NISAR GSLCs), GDAL's NETCDF driver
+    refuses to open the subdataset and reports "No such file or directory".
+    The HDF5 driver works on both raw HDF5 and CF-compliant HDF5, so
+    splitting on extension is the safe heuristic.
+
     Parameters
     ----------
     filename : str or PathLike
@@ -46,7 +56,8 @@ def format_nc_filename(filename: PathOrStr, ds_name: str | None = None) -> str:
     -------
     str
         Formatted filename like
-        NETCDF:"filename.nc":"//ds_name"
+        ``HDF5:"filename.h5":"//ds_name"`` or
+        ``NETCDF:"filename.nc":"//ds_name"``.
 
     Raises
     ------
@@ -58,15 +69,17 @@ def format_nc_filename(filename: PathOrStr, ds_name: str | None = None) -> str:
     if str(filename).startswith("NETCDF:") or str(filename).startswith("HDF5:"):
         return str(filename)
 
-    if not (os.fspath(filename).endswith(".nc") or os.fspath(filename).endswith(".h5")):
-        return os.fspath(filename)
+    fpath = os.fspath(filename)
+    if not (fpath.endswith((".nc", ".h5"))):
+        return fpath
 
     # Now we're definitely dealing with an HDF5/NetCDF file
     if ds_name is None:
         msg = "Must provide dataset name for HDF5/NetCDF files"
         raise ValueError(msg)
 
-    return f'NETCDF:"{filename}":"//{ds_name.lstrip("/")}"'
+    driver = "HDF5" if fpath.endswith(".h5") else "NETCDF"
+    return f'{driver}:"{filename}":"//{ds_name.lstrip("/")}"'
 
 
 def _get_path_from_gdal_str(name: PathOrStr) -> Path:

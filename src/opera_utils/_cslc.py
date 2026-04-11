@@ -600,8 +600,13 @@ def create_nodata_mask(
             msg = f"{opera_file_list[-1]} is not a CSLC file"
             raise ValueError(msg) from e
 
+    # NISAR GSLCs are pure HDF5 (no CF metadata) so the NETCDF driver
+    # refuses them; CF-compliant HDF5s like OPERA CSLCs work with either
+    # driver. Pick by file extension — `.h5` -> HDF5:, `.nc` -> NETCDF:.
+    last_file = fspath(opera_file_list[-1])
+    driver = "HDF5" if last_file.endswith(".h5") else "NETCDF"
+    test_f = f"{driver}:{last_file}:{dataset_name}"
     try:
-        test_f = f"NETCDF:{opera_file_list[-1]}:{dataset_name}"
         # convert pixels to degrees lat/lon
         gt = _get_raster_gt(test_f)
     except RuntimeError as e:
@@ -621,7 +626,7 @@ def create_nodata_mask(
     # This will get filled in with the polygon rasterization
     cmd = (
         f"gdal_calc.py --quiet --outfile {out_file} --type Byte  -A"
-        f" NETCDF:{opera_file_list[-1]}:{dataset_name} --calc 'numpy.nan_to_num(A)"
+        f" {test_f} --calc 'numpy.nan_to_num(A)"
         " * 0' --creation-option COMPRESS=LZW --creation-option TILED=YES"
         " --creation-option BLOCKXSIZE=256 --creation-option BLOCKYSIZE=256"
     )
