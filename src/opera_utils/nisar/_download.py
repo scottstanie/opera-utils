@@ -216,20 +216,27 @@ def _extract_subset_from_h5(
                     subset_data = coord_data[row_slice]
                 dst_freq_group.create_dataset(coord_name, data=subset_data)
 
-        # Copy every remaining scalar / ancillary dataset from the source
+        # Copy every remaining scalar / 1D ancillary dataset from the source
         # frequency group (rangeBandwidth, azimuthBandwidth, centerFrequency,
         # xCoordinateSpacing, yCoordinateSpacing, projection, epsg,
         # slantRangeSpacing, zeroDopplerTimeSpacing, listOfPolarizations,
         # numberOfSubSwaths, etc.). The polarization rasters and the
-        # already-subsetted x/y coordinate arrays are handled separately;
-        # everything else is small scalar or 1D metadata that downstream
-        # tools (dolphin, nisarqa, sweets' wavelength lookup) want to see.
+        # already-subsetted x/y coordinate arrays are handled separately,
+        # and any other 2D raster (e.g. `mask`, which is the full ~5 GB
+        # per-pixel quality flag raster) is skipped — subsetting it would
+        # require its own row/col slice machinery and none of the current
+        # downstream consumers need it.
         already_copied = {"xCoordinates", "yCoordinates"}
         for name in src[freq_path]:
             if name in NISAR_POLARIZATIONS or name in already_copied:
                 continue
             src_obj = src[freq_path][name]
             if not isinstance(src_obj, h5py.Dataset):
+                continue
+            if src_obj.ndim > 1:
+                # 2D+ rasters (e.g. `mask`) need proper subsetting; copying
+                # the whole thing over HTTP from a remote h5 would pull
+                # gigabytes of data for a small AOI.
                 continue
             dst_freq_group.create_dataset(name, data=src_obj[()])
 
