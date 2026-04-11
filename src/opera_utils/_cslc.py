@@ -600,11 +600,17 @@ def create_nodata_mask(
             msg = f"{opera_file_list[-1]} is not a CSLC file"
             raise ValueError(msg) from e
 
-    # NISAR GSLCs are pure HDF5 (no CF metadata) so the NETCDF driver
-    # refuses them; CF-compliant HDF5s like OPERA CSLCs work with either
-    # driver. Pick by file extension — `.h5` -> HDF5:, `.nc` -> NETCDF:.
+    # NISAR raw HDF5s have no CF metadata, so the NETCDF driver refuses
+    # them; every other CF-compliant HDF5 (OPERA CSLCs, COMPASS
+    # static_layers) needs the NETCDF driver to read its grid_mapping
+    # attribute — the bare HDF5 driver returns identity geotransform.
+    # Pick by filename prefix since NISAR granules all start with NISAR_.
     last_file = fspath(opera_file_list[-1])
-    driver = "HDF5" if last_file.endswith(".h5") else "NETCDF"
+    basename = Path(last_file).name.upper()
+    if last_file.endswith(".h5") and basename.startswith("NISAR_"):
+        driver = "HDF5"
+    else:
+        driver = "NETCDF"
     test_f = f"{driver}:{last_file}:{dataset_name}"
     try:
         # convert pixels to degrees lat/lon
