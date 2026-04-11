@@ -207,28 +207,31 @@ def _extract_subset_from_h5(
         for coord_name in [
             "xCoordinates",
             "yCoordinates",
-            "xCoordinateSpacing",
-            "yCoordinateSpacing",
         ]:
             if coord_name in src[freq_path]:
                 coord_data = src[freq_path][coord_name]
-                if coord_name in ["xCoordinates", "yCoordinates"]:
-                    # These need to be subsetted
-                    if coord_name == "xCoordinates":
-                        subset_data = coord_data[col_slice]
-                    else:
-                        subset_data = coord_data[row_slice]
-                    dst_freq_group.create_dataset(coord_name, data=subset_data)
+                if coord_name == "xCoordinates":
+                    subset_data = coord_data[col_slice]
                 else:
-                    # Scalar values, just copy
-                    dst_freq_group.create_dataset(coord_name, data=coord_data[()])
+                    subset_data = coord_data[row_slice]
+                dst_freq_group.create_dataset(coord_name, data=subset_data)
 
-        # Copy projection info if present
-        for proj_name in ["projection", "epsg"]:
-            if proj_name in src[freq_path]:
-                proj_data = src[freq_path][proj_name]
-                if isinstance(proj_data, h5py.Dataset):
-                    dst_freq_group.create_dataset(proj_name, data=proj_data[()])
+        # Copy every remaining scalar / ancillary dataset from the source
+        # frequency group (rangeBandwidth, azimuthBandwidth, centerFrequency,
+        # xCoordinateSpacing, yCoordinateSpacing, projection, epsg,
+        # slantRangeSpacing, zeroDopplerTimeSpacing, listOfPolarizations,
+        # numberOfSubSwaths, etc.). The polarization rasters and the
+        # already-subsetted x/y coordinate arrays are handled separately;
+        # everything else is small scalar or 1D metadata that downstream
+        # tools (dolphin, nisarqa, sweets' wavelength lookup) want to see.
+        already_copied = {"xCoordinates", "yCoordinates"}
+        for name in src[freq_path]:
+            if name in NISAR_POLARIZATIONS or name in already_copied:
+                continue
+            src_obj = src[freq_path][name]
+            if not isinstance(src_obj, h5py.Dataset):
+                continue
+            dst_freq_group.create_dataset(name, data=src_obj[()])
 
         # Extract each polarization
         for pol in pols_to_extract:
