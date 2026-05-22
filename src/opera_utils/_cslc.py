@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import re
-import subprocess
 import tempfile
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
@@ -626,29 +625,39 @@ def create_nodata_mask(
 
     # Get the union of all the polygons and convert to a temp geojson
     union_poly = get_union_polygon(opera_file_list, buffer_degrees=buffer_degrees)
-    # convert shapely polygon to geojson
 
-    # Make a dummy raster from the first file with all 0s
-    # This will get filled in with the polygon rasterization
-    cmd = (
-        f"gdal_calc.py --quiet --outfile {out_file} --type Byte  -A"
-        f" {test_f} --calc 'numpy.nan_to_num(A)"
-        " * 0' --creation-option COMPRESS=LZW --creation-option TILED=YES"
-        " --creation-option BLOCKXSIZE=256 --creation-option BLOCKYSIZE=256"
+    # Create a 0-filled Byte raster on `test_f`'s grid, then burn the polygon
+    # union into it. Only the granule's georeferencing is needed -- never its
+    # pixel values -- so just its metadata is read. A multi-GB granule can be
+    # many minutes to read in full, and a freshly created GDAL band is already
+    # all-zeros, so reading the data would only be discarded.
+    ref_ds = gdal.Open(test_f)
+    dst_ds = gdal.GetDriverByName("GTiff").Create(
+        fspath(out_file),
+        ref_ds.RasterXSize,
+        ref_ds.RasterYSize,
+        1,
+        gdal.GDT_Byte,
+        options=[
+            "COMPRESS=LZW",
+            "TILED=YES",
+            "BLOCKXSIZE=256",
+            "BLOCKYSIZE=256",
+        ],
     )
-    logger.info(cmd)
-    subprocess.check_call(cmd, shell=True)
+    dst_ds.SetGeoTransform(ref_ds.GetGeoTransform())
+    dst_ds.SetProjection(ref_ds.GetProjection())
+    ref_ds = None
+
     with tempfile.TemporaryDirectory() as tmpdir:
         temp_vector_file = Path(tmpdir) / "temp.geojson"
         with open(temp_vector_file, "w", encoding="utf-8") as f:
             f.write(json.dumps(geometry.mapping(union_poly)))
 
-        # Open the input vector file
+        # Burn the union of all polygons into the open output dataset.
         src_ds = gdal.OpenEx(fspath(temp_vector_file), gdal.OF_VECTOR)
-        dst_ds = gdal.Open(fspath(out_file), gdal.GA_Update)
-
-        # Now burn in the union of all polygons
         gdal.Rasterize(dst_ds, src_ds, burnValues=[1])
+    dst_ds = None
 
 
 make_nodata_mask = create_nodata_mask

@@ -250,3 +250,8 @@ def test_make_nodata_mask(tmp_path):
     assert bnd.DataType == gdal.GDT_Byte
     data = bnd.ReadAsArray()
     assert data.sum() > 0
+    # The mask must carry the granule's georeferencing: the raster is now
+    # created from metadata only, so a missing SetGeoTransform/SetProjection
+    # would leave it ungeoreferenced.
+    assert ds.GetProjection()
+    assert ds.GetGeoTransform() != (0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
