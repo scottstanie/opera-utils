@@ -105,6 +105,7 @@ jobs:
 
           echo "Reformatting to ${{ inputs.output_name }}"
           opera-utils disp-s1-reformat \
+            --quality-datasets None \
             --reference-method ${{ inputs.reference_method }} \
             --quality-datasets ${{ inputs.quality_datasets }} \
             --output-name ${{ inputs.output_name }} \
