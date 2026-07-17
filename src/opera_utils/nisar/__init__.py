@@ -33,6 +33,7 @@ from ._product import (
 from ._remote import open_file, open_h5
 from ._rslc_download import run_rslc_download
 from ._search import search
+from ._wavelength import get_nisar_wavelength
 
 __all__ = [
     "GslcProduct",
@@ -51,6 +52,7 @@ __all__ = [
     "get_gslc_mask",
     "get_gunw_mask",
     "get_nisar_bbox",
+    "get_nisar_wavelength",
     "get_orbit_for_granule",
     "load_gpkg",
     "nisar_frame_info",
