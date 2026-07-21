@@ -14,6 +14,13 @@ from ._info import (
     plot_frames,
 )
 from ._mask import get_gslc_mask, get_gunw_mask
+from ._orbit import (
+    NisarOrbit,
+    OrbitType,
+    download_orbits,
+    get_orbit_for_granule,
+    search_orbits,
+)
 from ._product import (
     GslcProduct,
     GunwProduct,
@@ -30,17 +37,21 @@ from ._search import search
 __all__ = [
     "GslcProduct",
     "GunwProduct",
+    "NisarOrbit",
     "NisarProduct",
     "OrbitDirection",
+    "OrbitType",
     "OutOfBoundsError",
     "RslcProduct",
     "UrlType",
     "download_gslcs",
+    "download_orbits",
     "find_intersecting_frames",
     "get_frame_latlon_bounds",
     "get_gslc_mask",
     "get_gunw_mask",
     "get_nisar_bbox",
+    "get_orbit_for_granule",
     "load_gpkg",
     "nisar_frame_info",
     "open_file",
@@ -51,4 +62,5 @@ __all__ = [
     "run_rslc_download",
     "search",
     "search_gunw",
+    "search_orbits",
 ]

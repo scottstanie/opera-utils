@@ -123,6 +123,21 @@ NISAR_GUNW_FILE_REGEX = (
     r"(?P<field3>[A-Z])_"
     r"(?P<counter>\d{3})"
 )
+# NISAR orbit ephemeris ancillary files, e.g.
+# NISAR_ANC_J_PR_POE_20260702T171245_20260619T205942_20260621T025942.xml
+# The three timestamps are, in order: file creation, start of validity, and
+# end of validity. Validity times are the useful ones for matching a granule.
+NISAR_ORBIT_FILE_REGEX = (
+    r"(?P<project>NISAR)_"
+    r"ANC_"
+    r"(?P<agency>[A-Z])_"
+    r"(?P<processing_type>[A-Z]{2})_"
+    r"(?P<orbit_type>POE|MOE|NOE|FOE)_"
+    r"(?P<creation_datetime>\d{8}T\d{6})_"
+    r"(?P<start_datetime>\d{8}T\d{6})_"
+    r"(?P<end_datetime>\d{8}T\d{6})"
+)
+
 # https://github.com/opera-adt/COMPASS/blob/16a3c1da2a5db69b9e2007d798a1110d3a6c5f9f/src/compass/utils/runconfig.py#L316-L318
 # {burst_id_str}_{date_str}
 COMPASS_FILE_REGEX = r"(?P<burst_id>t\d{3}_\d+_iw\d)_(?P<start_datetime>\d{8}).h5"
