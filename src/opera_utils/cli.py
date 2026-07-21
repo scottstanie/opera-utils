@@ -174,7 +174,9 @@ def cli_app() -> None:
 
     try:
         from opera_utils.nisar._download import run_download as nisar_download
+        from opera_utils.nisar._gunw_search import search_gunw as nisar_gunw_search
         from opera_utils.nisar._info import nisar_frame_info
+        from opera_utils.nisar._orbit import run_orbit_download as nisar_orbit_download
         from opera_utils.nisar._rslc_download import (
             run_rslc_download as nisar_rslc_download,
         )
@@ -186,6 +188,8 @@ def cli_app() -> None:
         cli_dict["nisar-rslc-search"] = partial(
             nisar_search, short_name="NISAR_L1_RSLC_BETA_V1", print_urls=True
         )
+        cli_dict["nisar-gunw-search"] = partial(nisar_gunw_search, print_urls=True)
+        cli_dict["nisar-orbit-download"] = nisar_orbit_download
         cli_dict["nisar-frame-info"] = nisar_frame_info
 
     except ImportError:

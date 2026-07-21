@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from ._download import run_download
+from ._download import download_gslcs, run_download
+from ._geometry import prepare_incidence_angle
+from ._gunw_search import search_gunw
 from ._info import (
     find_intersecting_frames,
     get_frame_latlon_bounds,
@@ -11,8 +13,17 @@ from ._info import (
     nisar_frame_info,
     plot_frames,
 )
+from ._mask import get_gslc_mask, get_gunw_mask
+from ._orbit import (
+    NisarOrbit,
+    OrbitType,
+    download_orbits,
+    get_orbit_for_granule,
+    search_orbits,
+)
 from ._product import (
     GslcProduct,
+    GunwProduct,
     NisarProduct,
     OrbitDirection,
     OutOfBoundsError,
@@ -25,20 +36,31 @@ from ._search import search
 
 __all__ = [
     "GslcProduct",
+    "GunwProduct",
+    "NisarOrbit",
     "NisarProduct",
     "OrbitDirection",
+    "OrbitType",
     "OutOfBoundsError",
     "RslcProduct",
     "UrlType",
+    "download_gslcs",
+    "download_orbits",
     "find_intersecting_frames",
     "get_frame_latlon_bounds",
+    "get_gslc_mask",
+    "get_gunw_mask",
     "get_nisar_bbox",
+    "get_orbit_for_granule",
     "load_gpkg",
     "nisar_frame_info",
     "open_file",
     "open_h5",
     "plot_frames",
+    "prepare_incidence_angle",
     "run_download",
     "run_rslc_download",
     "search",
+    "search_gunw",
+    "search_orbits",
 ]

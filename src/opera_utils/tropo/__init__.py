@@ -2,6 +2,7 @@
 
 from ._apply import apply_tropo
 from ._crop import crop_tropo
+from ._match import apply_tropo_correction, match_and_apply_tropo, read_reference_point
 from ._search import TropoProduct, search_tropo
 from ._slc_stack import (
     SLCReader,
@@ -17,12 +18,15 @@ __all__ = [
     "SLCReader",
     "TropoProduct",
     "apply_tropo",
+    "apply_tropo_correction",
     "create_tropo_corrections_for_stack",
     "crop_tropo",
     "extract_stack_info",
     "extract_stack_info_capella",
     "get_incidence_angle_capella",
     "get_sensor",
+    "match_and_apply_tropo",
+    "read_reference_point",
     "register_sensor",
     "search_tropo",
 ]

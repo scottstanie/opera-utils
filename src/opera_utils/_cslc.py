@@ -7,11 +7,12 @@ import tempfile
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from os import fspath
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
 import h5py
 import numpy as np
+from osgeo import osr
 from pyproj import CRS, Transformer
 from shapely import geometry, ops, wkt
 
@@ -599,88 +600,116 @@ def create_nodata_mask(
             msg = f"{opera_file_list[-1]} is not a CSLC file"
             raise ValueError(msg) from e
 
-    # NISAR raw HDF5s have no CF metadata, so the NETCDF driver refuses
-    # them; every other CF-compliant HDF5 (OPERA CSLCs, COMPASS
-    # static_layers) needs the NETCDF driver to read its grid_mapping
-    # attribute — the bare HDF5 driver returns identity geotransform.
-    # Pick by filename prefix since NISAR granules all start with NISAR_.
-    last_file = fspath(opera_file_list[-1])
-    basename = Path(last_file).name.upper()
-    if last_file.endswith(".h5") and basename.startswith("NISAR_"):
-        driver = "HDF5"
+    # GDAL's NETCDF driver can't derive a geotransform from NISAR's CF layout,
+    # and GDAL's HDF5 driver returns identity. Read it from h5py for NISAR;
+    # fall back to GDAL for OPERA-CSLC files.
+    is_nisar = "NISAR" in str(opera_file_list[-1])
+    if is_nisar:
+        gt, projection_wkt, x_size, y_size = _nisar_geotransform_and_grid(
+            opera_file_list[-1], dataset_name
+        )
     else:
-        driver = "NETCDF"
-    test_f = f"{driver}:{last_file}:{dataset_name}"
-    try:
-        # convert pixels to degrees lat/lon
-        gt = _get_raster_gt(test_f)
-    except RuntimeError as e:
-        msg = f"Unable to get geotransform from {test_f}"
-        raise ValueError(msg) from e
+        test_f = f"NETCDF:{opera_file_list[-1]}:{dataset_name}"
+        try:
+            src_ds = gdal.Open(fspath(test_f))
+            if src_ds is None:
+                msg = f"Unable to open {test_f}"
+                raise ValueError(msg)
+            gt = src_ds.GetGeoTransform()
+            projection_wkt = src_ds.GetProjection()
+            x_size = src_ds.RasterXSize
+            y_size = src_ds.RasterYSize
+            src_ds = None
+        except RuntimeError as e:
+            msg = f"Unable to get geotransform from {test_f}"
+            raise ValueError(msg) from e
+
     # TODO: more robust way to get the pixel size... this is a hack
     # maybe just use pyproj to warp lat/lon to meters and back?
-    dx_meters = gt[1]
-    dx_degrees = dx_meters / 111000
+    dx_degrees = gt[1] / 111000
     buffer_degrees = buffer_pixels * dx_degrees
 
     # Get the union of all the polygons and convert to a temp geojson
     union_poly = get_union_polygon(opera_file_list, buffer_degrees=buffer_degrees)
 
-    # Create a 0-filled Byte raster on `test_f`'s grid, then burn the polygon
-    # union into it. Only the granule's georeferencing is needed -- never its
-    # pixel values -- so just its metadata is read. A multi-GB granule can be
-    # many minutes to read in full, and a freshly created GDAL band is already
-    # all-zeros, so reading the data would only be discarded.
-    ref_ds = gdal.Open(test_f)
-    dst_ds = gdal.GetDriverByName("GTiff").Create(
+    # Build the 0-filled Byte template from the georeferencing read above, then
+    # burn the polygon union into it. The granule's pixel values are never
+    # needed, and a multi-GB granule can take many minutes to read in full.
+    drv = gdal.GetDriverByName("GTiff")
+    dst_ds = drv.Create(
         fspath(out_file),
-        ref_ds.RasterXSize,
-        ref_ds.RasterYSize,
+        x_size,
+        y_size,
         1,
         gdal.GDT_Byte,
-        options=[
-            "COMPRESS=LZW",
-            "TILED=YES",
-            "BLOCKXSIZE=256",
-            "BLOCKYSIZE=256",
-        ],
+        options=["COMPRESS=LZW", "TILED=YES", "BLOCKXSIZE=256", "BLOCKYSIZE=256"],
     )
-    dst_ds.SetGeoTransform(ref_ds.GetGeoTransform())
-    dst_ds.SetProjection(ref_ds.GetProjection())
-    ref_ds = None
-
+    dst_ds.SetGeoTransform(gt)
+    dst_ds.SetProjection(projection_wkt)
+    dst_ds.GetRasterBand(1).Fill(0)
+    dst_ds = None
     with tempfile.TemporaryDirectory() as tmpdir:
         temp_vector_file = Path(tmpdir) / "temp.geojson"
         with open(temp_vector_file, "w", encoding="utf-8") as f:
             f.write(json.dumps(geometry.mapping(union_poly)))
 
-        # Burn the union of all polygons into the open output dataset.
+        # Open the input vector file
         src_ds = gdal.OpenEx(fspath(temp_vector_file), gdal.OF_VECTOR)
+        dst_ds = gdal.Open(fspath(out_file), gdal.GA_Update)
+
+        # Now burn in the union of all polygons
         gdal.Rasterize(dst_ds, src_ds, burnValues=[1])
-    dst_ds = None
+
+
+def _nisar_geotransform_and_grid(
+    nisar_file: Filename, subdataset: str
+) -> tuple[tuple[float, float, float, float, float, float], str, int, int]:
+    """Read geotransform, projection WKT, and grid size from a NISAR GSLC HDF5.
+
+    NISAR's CF layout isn't recognized by GDAL's NETCDF driver and the HDF5
+    driver returns an identity transform — so read directly via h5py.
+    """
+    grid_path = str(PurePosixPath(subdataset).parent)
+    with h5py.File(nisar_file, "r") as f:
+        x_coords = f[f"{grid_path}/xCoordinates"][:]
+        y_coords = f[f"{grid_path}/yCoordinates"][:]
+        dx = float(f[f"{grid_path}/xCoordinateSpacing"][()])
+        dy = float(f[f"{grid_path}/yCoordinateSpacing"][()])
+        proj_dset_name = f[subdataset].attrs.get("grid_mapping", "projection")
+        if isinstance(proj_dset_name, bytes):
+            proj_dset_name = proj_dset_name.decode()
+        epsg_raw = f[f"{grid_path}/{proj_dset_name}"][()]
+        epsg = int(epsg_raw.decode()) if isinstance(epsg_raw, bytes) else int(epsg_raw)
+
+    nx, ny = len(x_coords), len(y_coords)
+    left = float(x_coords.min()) - abs(dx) / 2.0
+    top = float(y_coords.max()) + abs(dy) / 2.0
+    gt = (left, abs(dx), 0.0, top, 0.0, -abs(dy))
+
+    sr = osr.SpatialReference()
+    sr.ImportFromEPSG(epsg)
+    return gt, sr.ExportToWkt(), nx, ny
 
 
 make_nodata_mask = create_nodata_mask
 
 
 def _get_raster_gt(filename: Filename) -> list[float]:
-    """Get the geotransform from a file.
+    """Get the GDAL geotransform from a raster file.
 
     Parameters
     ----------
     filename : Filename
-        Path to the file to load.
+        Path to the raster file (supports any GDAL-readable format).
 
     Returns
     -------
-    List[float]
-        6 floats representing a GDAL Geotransform.
+    list[float]
+        Six-element GDAL geotransform.
 
     """
     if not HAS_GDAL:
         msg = "osgeo (GDAL) must be installed to use this function"
         raise ImportError(msg)
-
     ds = gdal.Open(fspath(filename))
-    gt = ds.GetGeoTransform()
-    return gt
+    return ds.GetGeoTransform()

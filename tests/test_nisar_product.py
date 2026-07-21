@@ -42,7 +42,7 @@ EXPECTED = {
     "relative_orbit_number": 76,
     "orbit_direction": OrbitDirection.ASCENDING,
     "track_frame_number": 22,
-    "subswath_id": "2005",
+    "bandwidth": "2005",
     "polarizations": "QPDH",
     "look_direction": "A",
     "start_datetime": datetime(2025, 11, 3, 11, 5, 14, tzinfo=timezone.utc),
@@ -138,11 +138,11 @@ class TestGslcProduct:
 
     def test_track_frame_id(self):
         product = GslcProduct.from_filename(FILE_1)
-        assert product.track_frame_id == "004_076_A_022"
+        assert product.track_frame_id == "076_A_022"
 
     def test_track_frame_id_descending(self):
         product = GslcProduct.from_filename(FILE_DESCENDING)
-        assert product.track_frame_id == "004_076_D_022"
+        assert product.track_frame_id == "076_D_022"
 
     def test_version(self):
         product = GslcProduct.from_filename(FILE_1)
