@@ -5,6 +5,7 @@ import pytest
 import xarray as xr
 
 from opera_utils.disp import reformat_stack
+from opera_utils.disp._enums import ReferenceMethod
 from opera_utils.disp._reformat import QUALITY_DATASETS, combine_quality_masks
 
 # UserWarning: Consolidated metadata is currently not part in the Zarr format 3 specification.
@@ -61,6 +62,32 @@ class TestReformatStack:
             assert ds_name in ds_stack_netcdf.data_vars
 
         assert ds_stack_netcdf.displacement.units == "meters"
+
+    @pytest.mark.skipif(
+        SKIP_TESTS, reason=f"No DISP-S1 input files found in {INPUT_DISP_S1_DIR}"
+    )
+    def test_reformat_stack_reference_method_none(self, tmp_path):
+        """ReferenceMethod.NONE must rebase without applying a spatial reference.
+
+        `_write_rebased_stack` has always handled NONE, but `reformat_stack` used to
+        raise "Unknown ReferenceMethod none" before ever reaching it.
+        """
+        input_files = list(INPUT_DISP_S1_DIR.glob("*.nc"))
+        output_name = tmp_path / "test-none.nc"
+
+        reformat_stack(
+            input_files=input_files,
+            output_name=output_name,
+            reference_method=ReferenceMethod.NONE,
+        )
+
+        ds = xr.open_dataset(output_name, engine="h5netcdf")
+        assert ds.displacement.shape[0] == len(input_files)
+
+        # With no spatial reference removed, the per-date scene median is free to drift.
+        # A referenced stack would have pinned it near zero.
+        medians = ds.displacement.median(dim=("y", "x")).values
+        assert not np.allclose(medians, 0, atol=1e-6)
 
     @pytest.mark.skipif(
         SKIP_TESTS, reason=f"No DISP-S1 input files found in {INPUT_DISP_S1_DIR}"

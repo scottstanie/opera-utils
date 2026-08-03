@@ -28,10 +28,14 @@ license = { file = "LICENSE.txt" }
 
 dependencies = [
   "aiohttp",
+  # `_remote` imports fsspec unconditionally, so it is a base dep, not just a `disp` one.
+  "fsspec",
   "h5py>=1.10",
   "numpy>=1.24",
   "pooch>=1.7",
   "pyproj>=3.3",
+  # `missing_data` imports rich.console/rich.table at module scope.
+  "rich",
   "s3fs",
   "shapely>=1.8",
   "typing_extensions>=4",

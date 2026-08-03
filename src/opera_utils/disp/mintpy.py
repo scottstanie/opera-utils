@@ -184,6 +184,17 @@ def create_reliability_mask(
     )
 
 
+def _find_one(directory: Path | str, pattern: str) -> Path:
+    """Find the single file in `directory` matching `pattern`."""
+    matches = sorted(Path(directory).glob(pattern))
+    if len(matches) != 1:
+        msg = (
+            f"Expected exactly 1 match for {pattern!r} in {directory}, found {matches}"
+        )
+        raise ValueError(msg)
+    return matches[0]
+
+
 def create_static_layers(
     los_enu_path: Path | str,
     meta: dict[str, Any],
@@ -382,11 +393,11 @@ def disp_nc_to_mintpy(
     # geometryGeo.h5
     # Download UTM DEM/LOS ENU/Layover shadow mask in `opera_utils.disp._download.py`
     if geometry_dir:
-        los_enu_path = next(Path(geometry_dir).glob("*los_enu.tif"))
-        dem_path = next(Path(geometry_dir).glob("*dem.tif"))
-        layover_shadow_mask_path = next(
-            Path(geometry_dir).glob("*layover_shadow_mask.tif")
-        )
+        # ASF publishes the DISP-S1-STATIC layer as `..._line_of_sight_enu.tif`; older
+        # hand-staged copies used `..._los_enu.tif`. `*_enu.tif` accepts both.
+        los_enu_path = _find_one(geometry_dir, "*_enu.tif")
+        dem_path = _find_one(geometry_dir, "*dem.tif")
+        layover_shadow_mask_path = _find_one(geometry_dir, "*layover_shadow_mask.tif")
 
     if los_enu_path:
         create_static_layers(

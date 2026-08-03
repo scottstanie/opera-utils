@@ -57,6 +57,7 @@ def reformat_stack(
     reference_lat: float | None = None,
     reference_border_pixels: int = 3,
     reference_coherence_threshold: float = 0.7,
+    nan_policy: NaNPolicy = NaNPolicy.propagate,
     process_chunk_size: tuple[int, int] = (512, 512),
     do_round: bool = True,
 ) -> None:
@@ -103,7 +104,7 @@ def reformat_stack(
         Default is [0.5].
     reference_method : ReferenceMethod
         Reference method to use.
-        Default is ReferenceMethod.NONE.
+        Default is ReferenceMethod.HIGH_COHERENCE.
         Options are:
         - ReferenceMethod.NONE: No reference method.
         - ReferenceMethod.POINT: Reference point.
@@ -124,6 +125,13 @@ def reformat_stack(
     reference_coherence_threshold : float
         For ReferenceMethod.HIGH_COHERENCE, threshold for coherence to use as a mask.
         Defaults to 0.7.
+    nan_policy : NaNPolicy
+        How to handle NaNs when accumulating across ministacks.
+        "propagate" (default) means one NaN epoch makes all later epochs NaN at that
+        pixel. Coverage shrinks over time
+        "omit" treats a NaN as zero displacement over that interval, never masking.
+        If using MintPy, must use "omit", as MintPy's time-function fitting
+        (`timeseries2velocity.py`) rejects partially-NaN pixels.
     process_chunk_size : tuple[int, int]
         Spatial chunking for processing. Controls peak memory during rebasing,
         where all time steps are loaded per spatial block.
@@ -282,6 +290,10 @@ def reformat_stack(
     elif reference_method in (ReferenceMethod.BORDER, ReferenceMethod.MEDIAN):
         good_pixel_mask = np.asarray(ds.water_mask) == 1
         ref_row = ref_col = None
+    elif reference_method is ReferenceMethod.NONE:
+        # No spatial referencing, so `_write_rebased_stack` never needs a mask.
+        good_pixel_mask = None
+        ref_row = ref_col = None
     else:
         msg = f"Unknown ReferenceMethod {reference_method}"
         raise ValueError(msg)
@@ -306,6 +318,7 @@ def reformat_stack(
         ds_corrections=ds_corrections[correction_names] if corrections else None,
         quality_datasets=quality_datasets,
         quality_thresholds=quality_thresholds,
+        nan_policy=nan_policy,
         process_chunk_size=process_chunk_size,
         shard_factors=shard_factors,
         do_round=do_round,
@@ -319,6 +332,7 @@ def reformat_stack(
             reference_datetimes=reference_datetimes,
             data_var=DisplacementDataset.SHORT_WAVELENGTH,
             out_format=out_format,
+            nan_policy=nan_policy,
             process_chunk_size=process_chunk_size,
             shard_factors=shard_factors,
             do_round=do_round,
