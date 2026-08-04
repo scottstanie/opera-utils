@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,16 @@ import xarray as xr
 from opera_utils.disp import DispProduct
 
 DEFAULT_CHUNKS = (1, 512, 512)
+# Peak memory for one slab of a 3-D stack. A multi-year frame subset is several GB,
+# so every pass over `time` below reads this much at a time instead of the whole stack.
+DEFAULT_SLAB_BYTES = 256 * 1024**2
+
+
+def _epochs_per_slab(
+    ny: int, nx: int, max_slab_bytes: int = DEFAULT_SLAB_BYTES, itemsize: int = 4
+) -> int:
+    """Get the number of whole epochs to hold in memory at once."""
+    return max(1, int(max_slab_bytes // (ny * nx * itemsize)))
 
 
 def _decimal_year(t: np.ndarray) -> np.ndarray:
@@ -63,15 +74,23 @@ def _write_hdf5(
     with h5py.File(out_f, "w") as f:
         for k, v in attrs.items():
             f.attrs[k] = v
-        # Copy all datasets from the input file
-        compression: str | None = "gzip"
+        # Copy all datasets from the input file.
+        # Compression is decided per dataset, by rank:
+        #   1-D (`date`, `bperp`): too small to be worth chunking.
+        #   2-D (velocity, masks, coherence): written and read whole, so compress.
+        #   3-D (the displacement stack): left uncompressed. MintPy's viewers read
+        #     small windows out of it, and gzip makes a windowed read ~36x slower
+        #     here to save ~60% of the file size.
         for name, (dtype, shape, data) in datasets.items():
             requested_chunks = DEFAULT_CHUNKS[-len(shape) :]  # Pick only last 2
+            compression: str | None = "gzip"
             if len(shape) < 2:
                 chunks = None
                 compression = None
             else:
                 chunks = tuple(min(c, s) for c, s in zip(requested_chunks, shape))
+                if len(shape) > 2:
+                    compression = None
             dset = f.create_dataset(
                 name, shape, dtype=dtype, chunks=chunks, compression=compression
             )
@@ -131,6 +150,7 @@ def create_reliability_mask(
     out_dir: Path,
     *,
     reliability_threshold: float = 0.90,
+    max_slab_bytes: int = DEFAULT_SLAB_BYTES,
 ) -> None:
     """Build 2-D reliability mask in MintPy format.
 
@@ -142,14 +162,21 @@ def create_reliability_mask(
         Destination folder.
     reliability_threshold : float, default 0.9
         Pixel must be valid in >= `reliability_threshold` of epochs to be kept.
+    max_slab_bytes : int
+        Peak memory to use while summing over `time`.
 
     """
     out_dir.mkdir(exist_ok=True, parents=True)
 
     nt, ny, nx = da_recommended.shape
 
-    # Compute density map and reliability mask
-    sum_valid = da_recommended.sum(axis=0).astype(np.float32)  # (#y, #x)
+    # Compute density map and reliability mask. The mask stack is the same size as
+    # the displacement stack, so sum over `time` a slab at a time.
+    sum_valid = np.zeros((ny, nx), dtype=np.float32)  # (#y, #x)
+    step = _epochs_per_slab(ny, nx, max_slab_bytes)
+    for t0 in range(0, nt, step):
+        slab = da_recommended[t0 : t0 + step].to_numpy()
+        sum_valid += slab.sum(axis=0, dtype=np.float32)
     density = sum_valid / nt
     thresh = int(np.ceil(nt * reliability_threshold))
     reliable = (sum_valid >= thresh).astype(np.int8)
@@ -253,6 +280,68 @@ def create_static_layers(
     print("Created geometryGeo.h5.")
 
 
+def _copy_and_fit_timeseries(
+    da_disp: xr.DataArray,
+    slope_weights: np.ndarray,
+    out_path: Path | None,
+    time_offset: int,
+    max_slab_bytes: int = DEFAULT_SLAB_BYTES,
+) -> np.ndarray:
+    """Stream the displacement stack once: copy it out, and fit a per-pixel slope.
+
+    Every pixel shares the same design matrix, so the ordinary-least-squares slope is
+    a *fixed* linear combination of the epochs. Passing that combination in as
+    `slope_weights` turns the fit into a running sum over `time`, so neither the stack
+    nor a least-squares workspace for all pixels at once has to be held in memory.
+
+    Parameters
+    ----------
+    da_disp : xr.DataArray
+        Lazily-opened (time, y, x) displacement stack.
+    slope_weights : np.ndarray
+        Length-`time` row of the design matrix pseudo-inverse corresponding to the
+        slope term.
+    out_path : Path or None
+        Existing `timeseries.h5` to fill in. Pass None to fit without copying, as
+        when `timeseries.h5` is a virtual link to `da_disp` and already has the data.
+    time_offset : int
+        Index of `da_disp`'s first epoch within `timeseries.h5`. 1 when a zero
+        reference epoch has been prepended.
+    max_slab_bytes : int
+        Peak memory to use for the stack itself.
+
+    Returns
+    -------
+    np.ndarray
+        (ny, nx) float32 slope, in metres per year.
+
+    """
+    nt, ny, nx = da_disp.shape
+    assert slope_weights.shape == (nt,), (slope_weights.shape, nt)
+
+    velocity = np.zeros((ny, nx), dtype=np.float32)
+    step = _epochs_per_slab(ny, nx, max_slab_bytes)
+    with (
+        h5py.File(out_path, "r+") if out_path is not None else nullcontext()
+    ) as out_file:
+        if out_file is not None and time_offset:
+            out_file["timeseries"][:time_offset] = 0.0
+        for t0 in range(0, nt, step):
+            t1 = min(t0 + step, nt)
+            slab = da_disp[t0:t1].to_numpy().astype(np.float32, copy=False)
+            if out_file is not None:
+                out_file["timeseries"][t0 + time_offset : t1 + time_offset] = slab
+            # (k,) @ (k, ny * nx) -> (ny * nx,): one matrix-vector product per slab.
+            # Masked pixels are NaN, and they stay NaN here just as they did under
+            # `lstsq`. Vectorized BLAS kernels raise spurious over/underflow flags on
+            # the NaN lanes alongside the real `invalid`, so ignore all three.
+            with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
+                velocity += (slope_weights[t0:t1] @ slab.reshape(t1 - t0, -1)).reshape(
+                    ny, nx
+                )
+    return velocity
+
+
 def disp_nc_to_mintpy(
     reformatted_nc_path: Path,
     /,
@@ -264,6 +353,7 @@ def disp_nc_to_mintpy(
     outdir: Path = Path("mintpy"),
     virtual: bool = False,
     reliability_threshold: float = 0.90,
+    max_slab_bytes: int = DEFAULT_SLAB_BYTES,
 ) -> None:
     """Convert a reformatted DISP-S1 NetCDF file to MintPy inputs.
 
@@ -297,23 +387,30 @@ def disp_nc_to_mintpy(
     reliability_threshold : float, optional
         Pixel must be valid in >= `reliability_threshold` of epochs to be kept.
         Default is 0.90
-
+    max_slab_bytes : int, optional
+        Approximate peak memory to use for stack data. Each 3-D layer is streamed
+        over `time` in slabs this large, so the whole stack never has to fit in
+        memory. Default is 256 MiB.
 
     """
     outdir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Load existing NetCDF
+    # 1. Load existing NetCDF. Nothing below reads a whole 3-D layer into memory:
+    # each is the size of the displacement stack, several GB for a multi-year subset.
     ds = xr.open_dataset(reformatted_nc_path, engine="h5netcdf")
     prod = DispProduct.from_filename(sample_disp_nc)
 
-    disp = ds["displacement"].transpose("time", "y", "x").data.astype(np.float32)
+    da_disp = ds["displacement"].transpose("time", "y", "x")
     times = ds["time"].data
     bperp = ds["perpendicular_baseline"].data.astype(np.float32)
+    nt_src, ny, nx = da_disp.shape
 
     # Prepend zero-reference epoch if reference_time precedes the first time
-    if "reference_time" in ds and ds["reference_time"].data[0] < times[0]:
+    prepend_reference = bool(
+        "reference_time" in ds and ds["reference_time"].data[0] < times[0]
+    )
+    if prepend_reference:
         ref_time = ds["reference_time"].data[0]
-        disp = np.concatenate([np.zeros((1, *disp.shape[1:]), dtype=np.float32), disp])
         times = np.concatenate([[ref_time], times])
         bperp = np.concatenate([np.array([0.0], dtype=np.float32), bperp])
 
@@ -325,8 +422,8 @@ def disp_nc_to_mintpy(
         dtype="S8",
     )
 
-    ny, nx = disp.shape[1:]
-    nt = disp.shape[0]
+    nt = len(dates)
+    assert nt == nt_src + int(prepend_reference), (nt, nt_src, prepend_reference)
 
     ts_meta = _mintpy_metadata(prod)
     if virtual:
@@ -341,22 +438,28 @@ def disp_nc_to_mintpy(
         )
         print("Done with timeseries.h5 (virtual link)")
     else:
-        # Copy displacement data directly to avoid VDS issues with MintPy
+        # Copy displacement data directly to avoid VDS issues with MintPy.
+        # Lay the file out empty here; `_copy_and_fit_timeseries` fills it in slabs.
         ts_dsets = {
             "date": (dates.dtype, dates.shape, dates),
             "bperp": (np.float32, bperp.shape, bperp),
-            "timeseries": (np.float32, disp.shape, disp),
+            "timeseries": (np.float32, (nt, ny, nx), None),
         }
         _write_hdf5(outdir / "timeseries.h5", ts_dsets, ts_meta)
-        print("Done with timeseries.h5 (copied data)")
 
     # 3. avgSpatialCoh.h5  (use average_temporal_coherence layer)
     if "average_temporal_coherence" in ds:
-        avg_coh = ds["average_temporal_coherence"].data.astype(np.float32)
+        avg_coh = ds["average_temporal_coherence"].to_numpy().astype(np.float32)
     else:
-        avg_coh = ds["temporal_coherence"].mean("time").data.astype(np.float32)
+        da_coh = ds["temporal_coherence"].transpose("time", "y", "x")
+        avg_coh = _copy_and_fit_timeseries(
+            da_coh,
+            slope_weights=np.full(nt_src, 1 / nt_src, dtype=np.float32),
+            out_path=None,
+            time_offset=0,
+            max_slab_bytes=max_slab_bytes,
+        )
 
-    # TODO: fix these to work in blocks!
     coh_meta = ts_meta | {"FILE_TYPE": "mask", "UNIT": "1"}
     coh_dsets = {"avgSpatialCoh": (np.float32, (ny, nx), avg_coh)}
     _write_hdf5(outdir / "avgSpatialCoh.h5", coh_dsets, coh_meta)
@@ -367,17 +470,28 @@ def disp_nc_to_mintpy(
         da_recommended=ds["recommended_mask"],
         out_dir=outdir,
         reliability_threshold=reliability_threshold,
+        max_slab_bytes=max_slab_bytes,
     )
 
-    # TODO: Use dolphin, or mintpy, or xarray to do this in batches
-    # 4. velocity.h5  (OLS fit, slope is m / yr)
+    # 4. velocity.h5  (OLS fit, slope is m / yr), and the timeseries.h5 data copy.
+    # Both come from one streaming pass over the stack.
     tdecimal = _decimal_year(times)  # shape (nt,)
     A = np.vstack([tdecimal, np.ones_like(tdecimal)]).T  # nt, 2
+    slope_weights = np.linalg.pinv(A)[0].astype(np.float32)  # nt,
+    if prepend_reference:
+        # The prepended epoch is identically zero, so it contributes nothing to the
+        # sum and does not need to be read back out of the file.
+        slope_weights = slope_weights[1:]
 
-    # reshape to (nt, ny*nx), fit in one go
-    y = disp.reshape(nt, -1)
-    coef, *_ = np.linalg.lstsq(A, y, rcond=None)  # 2, (ny*nx)
-    vel = coef[0, :].reshape(ny, nx).astype(np.float32)  # slope in m/yr
+    vel = _copy_and_fit_timeseries(
+        da_disp,
+        slope_weights=slope_weights,
+        out_path=None if virtual else outdir / "timeseries.h5",
+        time_offset=int(prepend_reference),
+        max_slab_bytes=max_slab_bytes,
+    )
+    if not virtual:
+        print("Done with timeseries.h5 (copied data)")
 
     vel_meta = ts_meta | {
         "FILE_TYPE": "velocity",
