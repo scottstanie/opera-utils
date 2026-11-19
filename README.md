@@ -100,7 +100,26 @@ Out[3]:
 
 ### DISP-S1 access
 
-### Download a subset from the command lind
+### Make analysis-ready stacks for a bounding box
+
+One command finds the frames that cover a region, downloads and crops the
+products, and writes one Zarr stack per frame plus a `stack_manifest.json`:
+
+```bash
+# See which frames cover the region, with product counts and dates
+opera-utils disp-s1-stack --bbox -118.68 34.40 -118.61 34.46 --list-only
+
+# Download, crop and reformat (no quality mask; the masks stay in the stack)
+opera-utils disp-s1-stack \
+    --bbox -118.68 34.40 -118.61 34.46 \
+    --start-datetime 2024-01-01 \
+    --output-dir chiquita
+```
+
+Run the same command again with a later `--end-datetime` to extend the stacks.
+Use `--frame-ids` or `--orbit-pass ASCENDING` to limit the frames.
+
+### Download a subset from the command line
 
 ```bash
 opera-utils disp-s1-download \
