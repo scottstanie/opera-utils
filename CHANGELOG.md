@@ -5,6 +5,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased](https://github.com/opera-adt/opera-utils/compare/v0.23.0...HEAD)
 
+### Added
+
+- `disp-s1-stack`: find the frames that cover a bounding box, download and crop their products, and write one Zarr stack per frame with a `stack_manifest.json`. No quality mask is applied by default.
+
+### Fixed
+
+- `disp-s1-download`: write each subset to a temporary name and rename it when complete, so an interrupted run leaves no partial file that the next run skips. Retry HTTPS connection errors and 429/5xx responses.
+
 ## [0.23.0](https://github.com/opera-adt/opera-utils/compare/v0.22.1...v0.23.0) - 2025-06-16
 
 ### Added

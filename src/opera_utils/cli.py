@@ -152,10 +152,12 @@ def cli_app() -> None:
         from opera_utils.disp._download import run_download
         from opera_utils.disp._reformat import reformat_stack
         from opera_utils.disp._search import search
+        from opera_utils.disp._stack import make_stack
 
         cli_dict["disp-s1-download"] = run_download
         cli_dict["disp-s1-search"] = partial(search, print_urls=True)
         cli_dict["disp-s1-reformat"] = reformat_stack
+        cli_dict["disp-s1-stack"] = make_stack
 
     except ImportError:
         pass

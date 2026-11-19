@@ -1,5 +1,7 @@
 import logging
 import tempfile
+import time
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 
@@ -13,7 +15,7 @@ from tqdm.contrib.concurrent import process_map
 
 from opera_utils.credentials import get_earthdata_username_password
 
-from ._product import DispProductStack
+from ._product import DispProduct, DispProductStack
 from ._remote import open_file
 from ._search import UrlType, search
 from ._utils import _get_netcdf_encoding
@@ -27,6 +29,7 @@ def process_file(
     cols: slice | None,
     output_dir: Path,
     session: requests.Session | None = None,
+    max_attempts: int = 3,
 ) -> Path:
     """Download and subset a single NetCDF product.
 
@@ -42,11 +45,17 @@ def process_file(
         Directory to save the downloaded and subsetted product to.
     session : requests.Session | None
         Authenticated Session to use for downloading the product.
+    max_attempts : int
+        Number of times to try an HTTPS download before raising.
+        Default is 3.
 
     Returns
     -------
     Path
-        Path to the downloaded and subsetted product
+        Path to the downloaded and subsetted product.
+        The subset is written to a temporary name in `output_dir` and renamed
+        when it is complete, so an interrupted run leaves no partial file
+        that a later run would skip as existing.
 
     """
     outname = f"{output_dir}/{Path(url).name}"
@@ -55,29 +64,55 @@ def process_file(
         logger.info(f"Skipped (exists): {outname}")
         return outpath
 
-    if Path(url).exists():
-        # For local files, it's fast to just open with xarray on the fsspec object
-        _extract_subset(url, outpath=outpath, rows=rows, cols=cols)
-    elif url.startswith("s3://"):
-        # For S3 urls, it's fast to just open with xarray on the fsspec object
-        with open_file(url) as in_f:
-            _extract_subset(in_f, outpath=outpath, rows=rows, cols=cols)
-    else:
-        with tempfile.NamedTemporaryFile(suffix=".nc") as tf:
-            temp_path = Path(tf.name)
-            # HTTPS seems to run much more slowly
-            if session is None:
-                session = requests.Session()
-                username, password = get_earthdata_username_password()
-                session.auth = (username, password)
-            response = session.get(url)
-            response.raise_for_status()
-            with open(temp_path, "wb") as out_f:
-                out_f.write(response.content)
-            _extract_subset(temp_path, outpath=outpath, rows=rows, cols=cols)
+    partial_path = outpath.with_name(f".{outpath.name}.partial")
+    partial_path.unlink(missing_ok=True)
+    try:
+        if Path(url).exists():
+            # For local files, it's fast to just open with xarray on the fsspec object
+            _extract_subset(url, outpath=partial_path, rows=rows, cols=cols)
+        elif url.startswith("s3://"):
+            # For S3 urls, it's fast to just open with xarray on the fsspec object
+            with open_file(url) as in_f:
+                _extract_subset(in_f, outpath=partial_path, rows=rows, cols=cols)
+        else:
+            with tempfile.NamedTemporaryFile(suffix=".nc") as tf:
+                temp_path = Path(tf.name)
+                # HTTPS seems to run much more slowly
+                if session is None:
+                    session = requests.Session()
+                    username, password = get_earthdata_username_password()
+                    session.auth = (username, password)
+                content = _get_with_retries(session, url, max_attempts=max_attempts)
+                with open(temp_path, "wb") as out_f:
+                    out_f.write(content)
+                _extract_subset(temp_path, outpath=partial_path, rows=rows, cols=cols)
+        Path(partial_path).replace(outpath)
+    finally:
+        partial_path.unlink(missing_ok=True)
 
-        logger.debug(f"Done: {outname}")
+    logger.debug(f"Done: {outname}")
     return outpath
+
+
+def _get_with_retries(
+    session: requests.Session, url: str, max_attempts: int, wait_seconds: float = 5.0
+) -> bytes:
+    """Download `url`, retrying connection errors and 5xx/429 responses."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = session.get(url)
+            if response.status_code in (429, 500, 502, 503, 504):
+                response.raise_for_status()
+        except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as e:
+            if attempt == max_attempts:
+                raise
+            logger.warning(f"Attempt {attempt} for {url} failed ({e}); retrying")
+            time.sleep(wait_seconds * attempt)
+            continue
+        response.raise_for_status()
+        return response.content
+    msg = f"max_attempts must be at least 1, got {max_attempts}"
+    raise ValueError(msg)
 
 
 def _extract_subset(
@@ -194,13 +229,6 @@ def run_download(
         poly = from_wkt(wkt)
         bbox = poly.bounds
 
-    if num_workers == 1:
-        session = requests.session()
-        username, password = get_earthdata_username_password()
-        session.auth = (username, password)
-    else:
-        session = None
-
     results = search(
         frame_id=frame_id,
         product_version=product_version,
@@ -210,15 +238,49 @@ def run_download(
     )
     n_urls = len(results)
     logger.info(f"Found {n_urls} urls for Frame {frame_id}")
+    return download_products(
+        results, bbox=bbox, output_dir=output_dir, num_workers=num_workers
+    )
 
-    dps = DispProductStack(results)
+
+def download_products(
+    products: Sequence[DispProduct],
+    bbox: tuple[float, float, float, float] | None,
+    output_dir: Path,
+    num_workers: int = 8,
+) -> list[Path]:
+    """Download and subset DISP-S1 products found by `search`.
+
+    Parameters
+    ----------
+    products : Sequence[DispProduct]
+        Products of one frame, for example from `opera_utils.disp.search`.
+    bbox : tuple[float, float, float, float] | None
+        (west, south, east, north) in degrees longitude/latitude to crop to.
+        If None, the full frame is saved.
+    output_dir : Path
+        Directory to save the subsets to. Existing complete subsets are kept.
+    num_workers : int
+        Number of parallel download processes. Default is 8.
+
+    Returns
+    -------
+    list[Path]
+        Paths to the subsets, in the order of `products`.
+
+    """
+    if num_workers == 1:
+        session = requests.session()
+        username, password = get_earthdata_username_password()
+        session.auth = (username, password)
+    else:
+        session = None
+
+    dps = DispProductStack(list(products))
 
     rows, cols = _get_rowcol_slice(dps, bbox)
     logger.info(f"Subsetting to Rows: {rows}, cols: {cols}")
-    jobs = [
-        (filename, rows, cols, output_dir, session)
-        for idx, filename in enumerate(dps.filenames)
-    ]
+    jobs = [(filename, rows, cols, output_dir, session) for filename in dps.filenames]
     output_dir.mkdir(exist_ok=True, parents=True)
 
     if num_workers == 1:
